@@ -235,25 +235,41 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     public static final String NETWORK_THREAD_PREFIX = "kafka-producer-network-thread";
     public static final String PRODUCER_METRIC_GROUP_NAME = "producer-metrics";
 
+    //生产者 id
     private final String clientId;
     // Visible for testing
     final Metrics metrics;
+    //分区，根据具体的分区策略，分配消息
     private final Partitioner partitioner;
+    //生产者发送消息最大值，默认 1MB ，可以通过 max.request.size 进行配置
     private final int maxRequestSize;
+    //生产者用于缓存消息的缓冲区大小，默认32MB， 可以通过buffer.memory 进行配置
     private final long totalMemorySize;
+    //每个Producer 实例的元数据
     private final ProducerMetadata metadata;
+    //消息寄存器，用于收集并缓存消息
     private final RecordAccumulator accumulator;
+    //sender ，用于发送消息，实现runnable 接口，在ioThread 线程种执行
     private final Sender sender;
+    // 执行Sender 任务发送消息，Sender 线程
     private final Thread ioThread;
+    //消息的压缩方式，默认为none，可以配置为gzip、snappy、lz4，可以通过compression.type进行配置
     private final CompressionType compressionType;
     private final Sensor errors;
     private final Time time;
+    //key 的序列化器
     private final Serializer<K> keySerializer;
+    //value 的序列化器
     private final Serializer<V> valueSerializer;
+    //生产者配置
     private final ProducerConfig producerConfig;
+    //通过判断发送消息(send) 或者 分区 最长等待时间 可以通过 max.block.ms
     private final long maxBlockTimeMs;
+    //拦截器
     private final ProducerInterceptors<K, V> interceptors;
+    //发送请求需要带的version，server端可以通过请求来判断是否过期请求等
     private final ApiVersions apiVersions;
+    //事务
     private final TransactionManager transactionManager;
 
     /**
@@ -880,6 +896,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             long nowMs = time.milliseconds();
             ClusterAndWaitTime clusterAndWaitTime;
             try {
+                //1. 集群元数据
                 clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), nowMs, maxBlockTimeMs);
             } catch (KafkaException e) {
                 if (metadata.isClosed())

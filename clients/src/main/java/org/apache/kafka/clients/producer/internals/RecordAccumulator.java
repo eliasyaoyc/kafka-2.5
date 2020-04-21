@@ -83,7 +83,9 @@ public final class RecordAccumulator {
     private final IncompleteBatches incomplete;
     // The following variables are only accessed by the sender thread, so we don't need to protect them.
     private final Map<TopicPartition, Long> muted;
+    //在使用 drain 方法批量导出 RecordBatch 时，为了防止饥饿，用此字段记录上次发送停止的位置，下次继续从此位置开始发送
     private int drainIndex;
+    //事务
     private final TransactionManager transactionManager;
     private long nextBatchExpiryTimeMs = Long.MAX_VALUE; // the earliest time (absolute) a batch will expire.
 
@@ -195,44 +197,59 @@ public final class RecordAccumulator {
                                      long nowMs) throws InterruptedException {
         // We keep track of the number of appending thread to make sure we do not miss batches in
         // abortIncompleteBatches().
+        //① 当前正在往 RecordAccumulator 中添加数据的线程数，cas 自增1
         appendsInProgress.incrementAndGet();
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
             // check if we have an in-progress batch
+            //② 通过 topic-partition 去 batches 中获取是否有正在使用的，有的话直接获取，没有的创建一个新的， Deque 是一个ArrayList。
             Deque<ProducerBatch> dq = getOrCreateDeque(tp);
+            // 通过synchronized 来保证线程安全
             synchronized (dq) {
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
+                //③ 尝试向 Deque 中最后一个ProducerBatch 追加 record，
+                //   如果这个ProducerBatch 已经满了那么返回null
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
                 if (appendResult != null)
+                    //④ 追加成功 直接返回
                     return appendResult;
             }
 
+            //--------------------------到这里就是在 第③步 中追加失败了---------------------------
+
             // we don't have an in-progress record batch try to allocate a new batch
+            //判断是否要丢弃这个batch ，是的话直接返回
             if (abortOnNewBatch) {
                 // Return a result that will cause another call to append.
                 return new RecordAppendResult(null, false, false, true);
             }
-
+            //⑤ 开始创建 batch
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+            //⑥ 计算这个batch 需要多少空间
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
+            //⑦ 创建空间
             buffer = free.allocate(size, maxTimeToBlock);
 
             // Update the current time in case the buffer allocation blocked above.
             nowMs = time.milliseconds();
+            //加锁
             synchronized (dq) {
                 // Need to check if producer is closed again after grabbing the dequeue lock.
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
 
+                //⑧ 再次尝试追加记录
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
+                //追加成功直接返回
                 if (appendResult != null) {
                     // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
                     return appendResult;
                 }
 
+                //⑨ 在新创建的ProducerBatch 中追加 Record ，并将其添加到 dp 集合中，和incomplete 集合中
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, nowMs);
                 FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(timestamp, key, value, headers,
@@ -247,7 +264,9 @@ public final class RecordAccumulator {
             }
         } finally {
             if (buffer != null)
+                //⑩ 释放内存
                 free.deallocate(buffer);
+            // appendsInProgress - 1
             appendsInProgress.decrementAndGet();
         }
     }

@@ -106,6 +106,7 @@ public class BufferPool {
                                                + " on memory allocations.");
 
         ByteBuffer buffer = null;
+        //① 加锁同步
         this.lock.lock();
 
         if (this.closed) {
@@ -115,12 +116,16 @@ public class BufferPool {
 
         try {
             // check if we have a free buffer of the right size pooled
+            //② 申请分配的是否是 poolableSize 指定大小的，并且 如果 free 中有空闲的ByteBuffer 直接获取返回
             if (size == poolableSize && !this.free.isEmpty())
                 return this.free.pollFirst();
 
             // now check if the request is immediately satisfiable with the
             // memory on hand or if we need to block
+            //③ 不满足② 计算当前 free 队列中的空间
             int freeListSize = freeSize() * this.poolableSize;
+
+            //④ 未分配的可用空间 > 所要分配的大小，也就是说有空间能进行分配，那么会进行分配
             if (this.nonPooledAvailableMemory + freeListSize >= size) {
                 // we have enough unallocated or pooled memory to immediately
                 // satisfy the request, but need to allocate the buffer
@@ -128,6 +133,7 @@ public class BufferPool {
                 this.nonPooledAvailableMemory -= size;
             } else {
                 // we are out of memory and will have to block
+                //⑤ 不够则加入条件队列进行堵塞
                 int accumulated = 0;
                 Condition moreMemory = this.lock.newCondition();
                 try {
@@ -140,6 +146,7 @@ public class BufferPool {
                         long timeNs;
                         boolean waitingTimeElapsed;
                         try {
+                            //⑥ 堵塞 超时时间为 remainingTimeToBlockNs
                             waitingTimeElapsed = !moreMemory.await(remainingTimeToBlockNs, TimeUnit.NANOSECONDS);
                         } finally {
                             long endWaitNs = time.nanoseconds();
@@ -158,10 +165,12 @@ public class BufferPool {
 
                         // check if we can satisfy this request from the free list,
                         // otherwise allocate memory
+                        //⑦ 有足够的空间分配了，则退出循环
                         if (accumulated == 0 && size == this.poolableSize && !this.free.isEmpty()) {
                             // just grab a buffer from the free list
                             buffer = this.free.pollFirst();
                             accumulated = size;
+                        //⑧ 否则先分配一部分，继续等待其他线程释放空间。
                         } else {
                             // we'll need to allocate memory, but we may only get
                             // part of what we need on this iteration
@@ -176,6 +185,7 @@ public class BufferPool {
                 } finally {
                     // When this loop was not able to successfully terminate don't loose available memory
                     this.nonPooledAvailableMemory += accumulated;
+                    //⑨ 已经分配了空间 从条件队列中删除
                     this.waiters.remove(moreMemory);
                 }
             }
@@ -183,10 +193,12 @@ public class BufferPool {
             // signal any additional waiters if there is more memory left
             // over for them
             try {
+                //⑩ 如果还有空间的 唤醒下一个线程
                 if (!(this.nonPooledAvailableMemory == 0 && this.free.isEmpty()) && !this.waiters.isEmpty())
                     this.waiters.peekFirst().signal();
             } finally {
                 // Another finally... otherwise find bugs complains
+                //⑪ 释放锁，整个过程都是同步的。
                 lock.unlock();
             }
         }

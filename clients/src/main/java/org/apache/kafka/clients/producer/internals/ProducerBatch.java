@@ -57,23 +57,34 @@ public final class ProducerBatch {
 
     private static final Logger log = LoggerFactory.getLogger(ProducerBatch.class);
 
+    //追加记录最后的状态：Aborted、Failed、Successed
     private enum FinalState { ABORTED, FAILED, SUCCEEDED }
 
     final long createdMs;
+    //topic 与 partition 的映射关系
     final TopicPartition topicPartition;
+    //标识ProducerBatch 的状态的future， 没有实现Future 接口，而是使用了 CountDownLatch 来实现类似Future 的功能
     final ProduceRequestResult produceFuture;
-
+    //Thunk 对象集合 ，ProducerBatch 的内部类
     private final List<Thunk> thunks = new ArrayList<>();
+    //MemoryRecords 的builder 模式
     private final MemoryRecordsBuilder recordsBuilder;
+    //尝试发送当前ProducerBatch的次数
     private final AtomicInteger attempts = new AtomicInteger(0);
-    private final boolean isSplitBatch;
-    private final AtomicReference<FinalState> finalState = new AtomicReference<>(null);
 
+    private final boolean isSplitBatch;
+    //状态
+    private final AtomicReference<FinalState> finalState = new AtomicReference<>(null);
+    //记录了当前保存的Record 个数
     int recordCount;
+    //最大record的字节数
     int maxRecordSize;
+    //最后一次尝试发送ProducerBatch的时间
     private long lastAttemptMs;
+    //最后一次追加record的时间
     private long lastAppendTime;
     private long drainedMs;
+    //是否正在重试
     private boolean retry;
     private boolean reopened;
 
@@ -115,6 +126,7 @@ public final class ProducerBatch {
                                                                    Time.SYSTEM);
             // we have to keep every future returned to the users in case the batch needs to be
             // split to several new batches and resent.
+            //每一次调用send 方法，都会有一个CallBack 对象，用于该条消息的回调，thunk就是封装这个消息的回调，thunks就是消息回调对象的集合
             thunks.add(new Thunk(callback, future));
             this.recordCount++;
             return future;

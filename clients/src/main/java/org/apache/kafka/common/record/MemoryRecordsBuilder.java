@@ -46,7 +46,9 @@ public class MemoryRecordsBuilder implements AutoCloseable {
         }
     });
 
+    //时间戳类型 CreateTime 还是 LogAppendTime
     private final TimestampType timestampType;
+    //压缩类型 zstd，lz4，gzip，snappy
     private final CompressionType compressionType;
     // Used to hold a reference to the underlying ByteBuffer so that we can write the record batch header and access
     // the written bytes. ByteBufferOutputStream allocates a new ByteBuffer if the existing one is not large enough,
@@ -58,6 +60,7 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     private final long logAppendTime;
     private final boolean isControlBatch;
     private final int partitionLeaderEpoch;
+    //记录 buffer 字段最多可以写入多少个字节的数据
     private final int writeLimit;
     private final int batchHeaderSizeInBytes;
 
