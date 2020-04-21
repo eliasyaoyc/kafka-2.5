@@ -129,7 +129,7 @@ public class MemoryRecordsBuilder implements AutoCloseable {
         this.batchHeaderSizeInBytes = AbstractRecords.recordBatchHeaderSizeInBytes(magic, compressionType);
 
         bufferStream.position(initialPosition + batchHeaderSizeInBytes);
-        this.bufferStream = bufferStream;
+        this.bufferStream = bufferStream; //这里就是ByteBuffer
         this.appendStream = new DataOutputStream(compressionType.wrapForOutput(this.bufferStream, magic));
     }
 
