@@ -482,6 +482,7 @@ public final class RecordAccumulator {
         long nextReadyCheckDelayMs = Long.MAX_VALUE;
         Set<String> unknownLeaderTopics = new HashSet<>();
 
+        //条件4：是有有其他线程在等待BufferPool释放空间
         boolean exhausted = this.free.queued() > 0;
         for (Map.Entry<TopicPartition, Deque<ProducerBatch>> entry : this.batches.entrySet()) {
             Deque<ProducerBatch> deque = entry.getValue();
@@ -496,12 +497,21 @@ public final class RecordAccumulator {
                         // This is a partition for which leader is not known, but messages are available to send.
                         // Note that entries are currently not removed from batches when deque is empty.
                         unknownLeaderTopics.add(part.topic());
+                        //能找到 Leader 节点 并且 不在 readyNodes 集合中，则需判断是否满足以下要求：
                     } else if (!readyNodes.contains(leader) && !isMuted(part, nowMs)) {
                         long waitedTimeMs = batch.waitedTimeMs(nowMs);
+                        // 条件1：这个条件涉及到两个参数 retry.backoff.ms 重试的间隔时间以及 linger.ms
+                        // 如果当前尝试次数>0说明之前发送失败了，所以根据 retry.backoff.ms 重试间隔时间 判断是否需要堵塞等待
+                        // 如果需要，timeToWaitMs 为true 需要堵塞，不会添加到 readyNodes 集合中
+                        // 如果不需要，那么要根据 linger.ms 判断是否需要等待，这个参数的意思就是，当Sender 线程准备来获取可发送的ProducerBatch的时候，是否需要等待默认为0 ，如果增加这个值，那么会给消息带来一定的延迟，但是会增加吞吐量
                         boolean backingOff = batch.attempts() > 0 && waitedTimeMs < retryBackoffMs;
                         long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs;
+                        //条件2：是否第一个ProducerBatch 满了或者有多个ProducerBatch
                         boolean full = deque.size() > 1 || batch.isFull();
+                        //条件3：是否超时
                         boolean expired = waitedTimeMs >= timeToWaitMs;
+                        //条件5： close ：Sender 准备关闭
+                        //条件6： flushInProgress 是否有线程正在等待flush 操作完成
                         boolean sendable = full || expired || exhausted || closed || flushInProgress();
                         if (sendable && !backingOff) {
                             readyNodes.add(leader);
