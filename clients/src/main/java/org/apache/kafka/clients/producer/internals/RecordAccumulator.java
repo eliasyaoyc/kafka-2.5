@@ -621,6 +621,7 @@ public final class RecordAccumulator {
                     // compression; in this case we will still eventually send this batch in a single request
                     break;
                 } else {
+                    //调用 shouldStopDrainBatchesForPartition 方法判断是否要停止 跟事务有关系，不是本次的重点
                     if (shouldStopDrainBatchesForPartition(first, tp))
                         break;
 
