@@ -36,6 +36,7 @@ import scala.collection.mutable
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 
+//Processor线程与Handler线程之间传递数据是通过RequestChannel完成
 object RequestChannel extends Logging {
   private val requestLogger = Logger("kafka.request.logger")
 
@@ -276,6 +277,7 @@ object RequestChannel extends Logging {
 class RequestChannel(val queueSize: Int, val metricNamePrefix : String) extends KafkaMetricsGroup {
   import RequestChannel._
   val metrics = new RequestChannel.Metrics
+  //processor 线程向handler 线程传递请求的队列，因为多个processor 线程和多个handler线程并发操作，所以选择线程安全的队列。
   private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
   private val processors = new ConcurrentHashMap[Int, Processor]()
   val requestQueueSizeMetricName = metricNamePrefix.concat(RequestQueueSizeMetric)
