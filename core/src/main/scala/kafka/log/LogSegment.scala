@@ -53,12 +53,12 @@ import scala.math._
  * @param time The time instance
  */
 @nonthreadsafe
-class LogSegment private[log] (val log: FileRecords,
-                               val lazyOffsetIndex: LazyIndex[OffsetIndex],
+class LogSegment private[log] (val log: FileRecords,//用于操作对应日志文件的FileRecords 对象
+                               val lazyOffsetIndex: LazyIndex[OffsetIndex],//index
                                val lazyTimeIndex: LazyIndex[TimeIndex],
-                               val txnIndex: TransactionIndex,
-                               val baseOffset: Long,
-                               val indexIntervalBytes: Int,
+                               val txnIndex: TransactionIndex,//事务index
+                               val baseOffset: Long,// LogSegment 中第一条消息的offset值
+                               val indexIntervalBytes: Int,//索引项之间间隔的的最小字节数
                                val rollJitterMs: Long,
                                val time: Time) extends Logging {
 
@@ -66,6 +66,7 @@ class LogSegment private[log] (val log: FileRecords,
 
   def timeIndex: TimeIndex = lazyTimeIndex.get
 
+  //是否要重新创建一个 segment
   def shouldRoll(rollParams: RollParams): Boolean = {
     val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
     size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
@@ -91,9 +92,12 @@ class LogSegment private[log] (val log: FileRecords,
     else throw new NoSuchFileException(s"Offset index file ${lazyOffsetIndex.file.getAbsolutePath} does not exist")
   }
 
+  //标识 LogSegment 对象创建时间，当调用 truncateTo() 方法将整个日志文件清空时，
+  //会将此字段重置为当前时间。
   private var created = time.milliseconds
 
   /* the number of bytes since we last added an entry in the offset index */
+  //记录自从上次添加索引项之后，在日志文件中累计加入Message集合的字节数，用于判断下次索引项添加的时机
   private var bytesSinceLastIndexEntry = 0
 
   // The timestamp we used for time based log rolling and for ensuring max compaction delay
@@ -141,20 +145,22 @@ class LogSegment private[log] (val log: FileRecords,
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
    */
   @nonthreadsafe
-  def append(largestOffset: Long,
-             largestTimestamp: Long,
+  def append(largestOffset: Long, //在这个分段中最大的offset
+             largestTimestamp: Long,//在这个分段中最大的时间戳
              shallowOffsetOfMaxTimestamp: Long,
-             records: MemoryRecords): Unit = {
+             records: MemoryRecords): Unit = {//要追加的日志条目
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
-      val physicalPosition = log.sizeInBytes()
+      val physicalPosition = log.sizeInBytes()//该条目需要添加的位置
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
 
+      //确保索引在这个分段范围内
       ensureOffsetInRange(largestOffset)
 
       // append the messages
+      //添加日志
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
