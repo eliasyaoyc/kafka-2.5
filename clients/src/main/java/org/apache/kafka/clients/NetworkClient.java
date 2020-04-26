@@ -71,7 +71,7 @@ import java.util.stream.Collectors;
  * This class is not thread-safe!
  */
 public class NetworkClient implements KafkaClient {
-
+    //状态枚举
     private enum State {
         ACTIVE,
         CLOSING,
@@ -81,22 +81,28 @@ public class NetworkClient implements KafkaClient {
     private final Logger log;
 
     /* the selector used to perform network i/o */
+    //selector
     private final Selectable selector;
 
+    //更新元数据
     private final MetadataUpdater metadataUpdater;
 
     private final Random randOffset;
 
     /* the state of each node's connection */
+    //每个节点的连接状态，底层使用 HashMap 管理
     private final ClusterConnectionStates connectionStates;
 
     /* the set of requests currently being sent or awaiting a response */
+    //缓存发送出去的消息但是还没有得到响应的请求
     private final InFlightRequests inFlightRequests;
 
     /* the socket send buffer size in bytes */
+    //发送最大的字节数 默认是100 * 1024 可以通过`socket.send.buffer.bytes`配置
     private final int socketSendBuffer;
 
     /* the socket receive size buffer in bytes */
+    //接收最大的字节数 默认是100 * 1024 可以通过 `socket.receive.buffer.bytes` 配置
     private final int socketReceiveBuffer;
 
     /* the client id used to identify this client in requests to the server */
@@ -106,9 +112,11 @@ public class NetworkClient implements KafkaClient {
     private int correlation;
 
     /* default timeout for individual requests to await acknowledgement from servers */
+    //默认超时时间
     private final int defaultRequestTimeoutMs;
 
     /* time in ms to wait before retrying to create connection to a server */
+    //重试 需要等待的时间
     private final long reconnectBackoffMs;
 
     private final ClientDnsLookup clientDnsLookup;

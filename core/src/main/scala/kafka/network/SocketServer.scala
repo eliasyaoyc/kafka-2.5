@@ -79,7 +79,7 @@ class SocketServer(val config: KafkaConfig,
                    val credentialProvider: CredentialProvider)
   extends Logging with KafkaMetricsGroup with BrokerReconfigurable {
 
-  //在RequestChannel 的 requestQueue 中缓存的最大请求个数, 默认是500  可以通过queued.max.requests进行配置
+  //① 在RequestChannel 的 requestQueue 中缓存的最大请求个数, 默认是500  可以通过queued.max.requests进行配置
   private val maxQueuedRequests = config.queuedMaxRequests
 
   private val logContext = new LogContext(s"[SocketServer brokerId=${config.brokerId}] ")
@@ -89,22 +89,24 @@ class SocketServer(val config: KafkaConfig,
   private val memoryPoolDepletedPercentMetricName = metrics.metricName("MemoryPoolAvgDepletedPercent", MetricsGroup)
   private val memoryPoolDepletedTimeMetricName = metrics.metricName("MemoryPoolDepletedTimeTotal", MetricsGroup)
   memoryPoolSensor.add(new Meter(TimeUnit.MILLISECONDS, memoryPoolDepletedPercentMetricName, memoryPoolDepletedTimeMetricName))
+  //② 内存池  和RecordAccumualtor中的BufferPool 一个意思 `socket.request.max.bytes`：最大字节数，超过会报错。默认是100M
   private val memoryPool = if (config.queuedMaxBytes > 0) new SimpleMemoryPool(config.queuedMaxBytes, config.socketRequestMaxBytes, false, memoryPoolSensor) else MemoryPool.NONE
-  // data-plane  数据平面的Processor 集合
+  //③ data-plane  数据平面的Processor 集合
   private val dataPlaneProcessors = new ConcurrentHashMap[Int, Processor]()
-  // 数据平面 EndPoint Acceptor的映射关系：
+  //④ 数据平面 EndPoint Acceptor的映射关系：
   //EndPoint ：一般服务器都有多个网卡，可以配置多个IP，kafka 可以监听多个端口，EndPoint 封装了多个需要监听的Host、Port及使用的网络协议
   //每个EndPoint 都会创建对应的Acceptor，也就是说一个指定的IP,Port 都有一个Acceptor监听
   private[network] val dataPlaneAcceptors = new ConcurrentHashMap[EndPoint, Acceptor]()
+  //⑤ Processor 线程与 Handler 线程交互的信息的队列
   val dataPlaneRequestChannel = new RequestChannel(maxQueuedRequests, DataPlaneMetricPrefix)
   // control-plane
   private var controlPlaneProcessorOpt : Option[Processor] = None
   private[network] var controlPlaneAcceptorOpt : Option[Acceptor] = None
   val controlPlaneRequestChannelOpt: Option[RequestChannel] = config.controlPlaneListenerName.map(_ => new RequestChannel(20, ControlPlaneMetricPrefix))
 
-  //下一个Processor Id
+  //⑥ 下一个Processor Id
   private var nextProcessorId = 0
-  //提供了控制每个 IP 上的最大连接数的功能。底层通过Map对象，记录每个IP 地址上建立的连接数。
+  //⑦ 提供了控制每个 IP 上的最大连接数的功能。底层通过Map对象，记录每个IP 地址上建立的连接数。
   //创建新Connect 时与 maxConnectionsPerIpOverrides(或者maxConnectionsPerIp) 指定的最大值进行比较。
   //超过则报错，因为有多个Acceptor 线程并发访问底层的 Map 对象，则需要synchronized 进行同步
   private var connectionQuotas: ConnectionQuotas = _
@@ -223,11 +225,17 @@ class SocketServer(val config: KafkaConfig,
   private def createDataPlaneAcceptorsAndProcessors(dataProcessorsPerListener: Int,
                                                     endpoints: Seq[EndPoint]): Unit = synchronized {
     endpoints.foreach { endpoint =>
+      //在connectionQuotas监听器添加监听器，如果这个端点之前已经有监听器监听了，那么直接唤醒，否则创建加入唤醒
       connectionQuotas.addListener(config, endpoint.listenerName)
+      //创建acceptor线程
       val dataPlaneAcceptor = createAcceptor(endpoint, DataPlaneMetricPrefix)
+      //给创建的acceptor 线程添加processor 线程
       addDataPlaneProcessors(dataPlaneAcceptor, endpoint, dataProcessorsPerListener)
+      //启动dataPlaneAcceptor线程
       KafkaThread.nonDaemon(s"data-plane-kafka-socket-acceptor-${endpoint.listenerName}-${endpoint.securityProtocol}-${endpoint.port}", dataPlaneAcceptor).start()
+      //等待 connection ，如果有会唤醒。
       dataPlaneAcceptor.awaitStartup()
+      //放入dataPlaneAcceptors中
       dataPlaneAcceptors.put(endpoint, dataPlaneAcceptor)
       info(s"Created data-plane acceptor and processors for endpoint : $endpoint")
     }
@@ -1163,7 +1171,9 @@ class ConnectionQuotas(config: KafkaConfig, time: Time) extends Logging {
   @volatile private var defaultMaxConnectionsPerIp: Int = config.maxConnectionsPerIp
   //具体指定某IP上最大的连接数，这里指定的最大连接数会覆盖上面 maxConnectionsPerIp  字段的值，通过max.connections.per.ip.overrides配置，默认是 ""
   @volatile private var maxConnectionsPerIpOverrides = config.maxConnectionsPerIpOverrides.map { case (host, count) => (InetAddress.getByName(host), count) }
+  //broker 的最大连接数， max.connections 默认值 Integer.MAX_VALUE(2的31次方-1)
   @volatile private var brokerMaxConnections = config.maxConnections
+  //ip 与 连接数的映射关系
   private val counts = mutable.Map[InetAddress, Int]()
 
   // Listener counts and configs are synchronized on `counts`

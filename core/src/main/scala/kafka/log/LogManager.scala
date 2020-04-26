@@ -46,7 +46,7 @@ import scala.util.{Failure, Success, Try}
  * A background thread handles log retention by periodically truncating excess log segments.
  */
 @threadsafe
-class LogManager(logDirs: Seq[File],
+class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties 配置文件中通过log.dirs 项指定的多个目录。每个目录下可以创建多个Log，每个log 都有自己对应的目录，LogManager 在创建Log时会选择Log最少的log目录创建Log
                  initialOfflineDirs: Seq[File],
                  val topicConfigs: Map[String, LogConfig], // note that this doesn't get updated after creation
                  val initialDefaultConfig: LogConfig,
@@ -101,7 +101,11 @@ class LogManager(logDirs: Seq[File],
       _liveLogDirs.asScala.toBuffer
   }
 
+  //dirLocks：FileLock 集合，这些FileLock 用来在文件系统层面为每个Log 目录加文件锁。在LogManager 对象初始化时，就会将所有的log目录加锁
   private val dirLocks = lockLogDirs(liveLogDirs)
+  //Map(File,OffsetCheckpointFile) 类型，用于管理每个log目录与其下的RecoveryPointCheckPoint文件之间的映射关系，在LogManager 对象初始化时，
+  //会在每个目录下创建一个对应的RecoveryPointCheckpoint 文件。此map 的value 是offsetCheckpoint对象。其中封装了对应log目录下的RecoveryPointCheckpoint文件，
+  //并提供对RecoveryPointCheckpoint 文件的读写操作。Recovery文件中则记录了该log目录下的所有Log的recoveryPoint。
   @volatile private var recoveryPointCheckpoints = liveLogDirs.map(dir =>
     (dir, new OffsetCheckpointFile(new File(dir, RecoveryPointCheckpointFile), logDirFailureChannel))).toMap
   @volatile private var logStartOffsetCheckpoints = liveLogDirs.map(dir =>
@@ -384,39 +388,41 @@ class LogManager(logDirs: Seq[File],
 
   /**
    *  Start the background threads to flush logs and do log cleanup
+   *  初始化
    */
   def startup(): Unit = {
     /* Schedule the cleanup task to delete old logs */
+    //在KafkaServer 中初始化的 Schedule 传入，开定时的清理log的任务
     if (scheduler != null) {
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
-      scheduler.schedule("kafka-log-retention",
-                         cleanupLogs _,
-                         delay = InitialTaskDelayMs,
-                         period = retentionCheckMs,
+      scheduler.schedule("kafka-log-retention", //LogSegment 清理任务
+                         cleanupLogs _, //核心方法
+                         delay = InitialTaskDelayMs, // 30 * 1000  启动延迟时间30秒
+                         period = retentionCheckMs, // 每次检查过期 log 的间隔时间  通过 log.retention.check.interval.ms 配置 默认300000毫秒也就是每5分钟检查一次。
                          TimeUnit.MILLISECONDS)
       info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
-      scheduler.schedule("kafka-log-flusher",
-                         flushDirtyLogs _,
+      scheduler.schedule("kafka-log-flusher", //定时 flush log 到磁盘
+                         flushDirtyLogs _, //核心方法
                          delay = InitialTaskDelayMs,
-                         period = flushCheckMs,
+                         period = flushCheckMs,//检查时间 通过log.flush.scheduler.interval.ms 配置 默认 Long.maxValue 2的63次方 -1.
                          TimeUnit.MILLISECONDS)
-      scheduler.schedule("kafka-recovery-point-checkpoint",
-                         checkpointLogRecoveryOffsets _,
+      scheduler.schedule("kafka-recovery-point-checkpoint", //定时将recovery-point 写入到  kafka-recovery-point-checkpoint文件中。
+                         checkpointLogRecoveryOffsets _, //核心方法
                          delay = InitialTaskDelayMs,
-                         period = flushRecoveryOffsetCheckpointMs,
+                         period = flushRecoveryOffsetCheckpointMs, //间隔时间 通过log.flush.offset.checkpoint.interval.ms 配置，默认60000 毫秒
                          TimeUnit.MILLISECONDS)
-      scheduler.schedule("kafka-log-start-offset-checkpoint",
-                         checkpointLogStartOffsets _,
+      scheduler.schedule("kafka-log-start-offset-checkpoint",  //lso 的检查任务
+                         checkpointLogStartOffsets _,//核心方法
                          delay = InitialTaskDelayMs,
-                         period = flushStartOffsetCheckpointMs,
+                         period = flushStartOffsetCheckpointMs, //间隔时间  通过 log.flush.start.offset.checkpoint.interval.ms配置，默认60000 毫秒
                          TimeUnit.MILLISECONDS)
       scheduler.schedule("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
-                         deleteLogs _,
+                         deleteLogs _,//核心方法
                          delay = InitialTaskDelayMs,
                          unit = TimeUnit.MILLISECONDS)
     }
     if (cleanerConfig.enableCleaner)
-      cleaner.startup()
+      cleaner.startup()  //启动cleaner 线程
   }
 
   /**

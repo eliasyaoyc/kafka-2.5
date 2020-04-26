@@ -532,6 +532,7 @@ public class Sender implements Runnable {
         RequestHeader requestHeader = response.requestHeader();
         long receivedTimeMs = response.receivedTimeMs();
         int correlationId = requestHeader.correlationId();
+        //① 如果是因为断开连接或异常而产生的响应
         if (response.wasDisconnected()) {
             log.trace("Cancelled request with header {} due to node {} being disconnected",
                 requestHeader, response.destination());
