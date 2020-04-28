@@ -110,7 +110,7 @@ versions += [
   scoverage: "1.4.1",
   scoveragePlugin: "4.0.1",
   shadowPlugin: "5.2.0",
-  slf4j: "1.7.30",
+  slf4j: "1.7.26",
   snappy: "1.1.7.3",
   spotbugs: "3.1.12",
   spotbugsPlugin: "3.0.0",

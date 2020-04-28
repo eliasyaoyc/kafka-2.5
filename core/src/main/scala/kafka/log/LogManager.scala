@@ -411,7 +411,7 @@ class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties �
                          delay = InitialTaskDelayMs,
                          period = flushRecoveryOffsetCheckpointMs, //间隔时间 通过log.flush.offset.checkpoint.interval.ms 配置，默认60000 毫秒
                          TimeUnit.MILLISECONDS)
-      scheduler.schedule("kafka-log-start-offset-checkpoint",  //lso 的检查任务
+      scheduler.schedule("kafka-log-start-offset-checkpoint",  //lso 的检查任务(它用来标识日志的起始偏移量。各个副本在变动 LEO 和 HW的过程中，logStartOffset 也有可能随之而动，Kafka 也有一个定时任务来负责将所有分区的logStartOffset书写到起始点文件log-start-offset-checkpoint中)
                          checkpointLogStartOffsets _,//核心方法
                          delay = InitialTaskDelayMs,
                          period = flushStartOffsetCheckpointMs, //间隔时间  通过 log.flush.start.offset.checkpoint.interval.ms配置，默认60000 毫秒

@@ -952,10 +952,13 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
+  //添加 record 到 leader 节点，在RecordAccumulator 中是把record 放入 memoryRecords(ByteBuffer)中的，所以这里也是
   def appendRecordsToLeader(records: MemoryRecords, origin: AppendOrigin, requiredAcks: Int): LogAppendInfo = {
+    //read lock 线程安全，因为有多个Handler 线程 如果不加锁的话会出现线程问题。
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock) {
       leaderLogIfLocal match {
         case Some(leaderLog) =>
+          //根据配置获取 需要多少个isr 节点添加到该条记录。
           val minIsr = leaderLog.config.minInSyncReplicas
           val inSyncSize = inSyncReplicaIds.size
 
@@ -965,6 +968,7 @@ class Partition(val topicPartition: TopicPartition,
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
           }
 
+          //调用 log#appendAsLeader 添加 记录
           val info = leaderLog.appendAsLeader(records, leaderEpoch = this.leaderEpoch, origin,
             interBrokerProtocolVersion)
 

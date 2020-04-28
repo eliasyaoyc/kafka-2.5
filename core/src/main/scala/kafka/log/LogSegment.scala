@@ -68,8 +68,9 @@ class LogSegment private[log] (val log: FileRecords,
 
   def shouldRoll(rollParams: RollParams): Boolean = {
     val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
-    size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
-      (size > 0 && reachedRollMs) ||
+    size > rollParams.maxSegmentBytes - rollParams.messagesSize ||  //条件1 logSegment 满了
+      (size > 0 && reachedRollMs) || //条件2 当前activeSegment 的寿命超过了配置的 LogSegment 最长存活时间
+      //条件3 索引满了
       offsetIndex.isFull || timeIndex.isFull || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages)
   }
 

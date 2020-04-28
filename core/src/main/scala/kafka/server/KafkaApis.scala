@@ -125,9 +125,12 @@ class KafkaApis(val requestChannel: RequestChannel,
       trace(s"Handling request:${request.requestDesc(true)} from connection ${request.context.connectionId};" +
         s"securityProtocol:${request.context.securityProtocol},principal:${request.context.principal}")
       request.header.apiKey match {
+        //处理 Producer 请求
         case ApiKeys.PRODUCE => handleProduceRequest(request)
+        //处理 Consumer 请求
         case ApiKeys.FETCH => handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleListOffsetRequest(request)
+        //元数据 请求
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
         case ApiKeys.LEADER_AND_ISR => handleLeaderAndIsrRequest(request)
         case ApiKeys.STOP_REPLICA => handleStopReplicaRequest(request)
@@ -463,9 +466,12 @@ class KafkaApis(val requestChannel: RequestChannel,
    * Handle a produce request
    */
   def handleProduceRequest(request: RequestChannel.Request): Unit = {
+    //获取 ProduceRequest
     val produceRequest = request.body[ProduceRequest]
+    //从 ProduceRequest 中获取这次 append 的字节数
     val numBytesAppended = request.header.toStruct.sizeOf + request.sizeOfBodyInBytes
 
+    //是否开启事务。
     if (produceRequest.hasTransactionalRecords) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
         authorize(request, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
@@ -474,7 +480,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         return
       }
       // Note that authorization to a transactionalId implies ProducerId authorization
-
+      //是否开启了幂等，如果设置了权限校验权限
     } else if (produceRequest.hasIdempotentRecords && !authorize(request, IDEMPOTENT_WRITE, CLUSTER, CLUSTER_NAME)) {
       sendErrorResponseMaybeThrottle(request, Errors.CLUSTER_AUTHORIZATION_FAILED.exception)
       return

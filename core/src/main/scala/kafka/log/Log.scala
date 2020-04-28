@@ -1096,7 +1096,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
                      assignOffsets: Boolean,
                      leaderEpoch: Int): LogAppendInfo = {
     maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
-      // ① 分析和验证待写入消息集合，并返回校验结果
+      // ① 分析和验证待写入消息集合，并返回校验结果，验证消息的长度、crc32校验码、内部offset 是否单调递增，都是对外层消息进行的，并不会解压内部的压缩消息
       val appendInfo = analyzeAndValidateRecords(records, origin)
 
       // return if we have no valid messages or if this is a duplicate of the last appended entry
@@ -1105,7 +1105,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
         return appendInfo
 
       // trim any invalid bytes or partial messages before appending it to the on-disk log
-      // ② 消息格式规整，即删除无效格式消息或无效字节
+      // ② 消息格式规整，即删除无效格式消息或无效字节，根据步骤 ① 方法返回的LogAppendInfo 对象，将未通过验证的消息截断
       var validRecords = trimInvalidBytes(records, appendInfo)
 
       // they are valid, insert them in the log
@@ -1210,7 +1210,10 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
         }
 
         // maybe roll the log if this segment is full
-        //⑦ 执行日志切分，当前日志断剩余容量可能无法容纳新消息集合，因此要创建一个
+        //⑦ 执行日志切分，当前日志断剩余容量可能无法容纳新消息集合，因此要创建一个(如果满足需要创建一个新的activeSegment，然后返回当前的activeSegment)
+        // 1. 当前activeSegment 的日志大小加上本次待追加的消息集合大小，超过配置的LogSegment 的最大长度
+        // 2. 当前activeSegment 的寿命超过了配置的 LogSegment 最长存活时间
+        // 3. 索引文件满了
         val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
 
         val logOffsetMetadata = LogOffsetMetadata(
@@ -1398,14 +1401,14 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
    * </ol>
    */
   private def analyzeAndValidateRecords(records: MemoryRecords, origin: AppendOrigin): LogAppendInfo = {
-    var shallowMessageCount = 0
-    var validBytesCount = 0
-    var firstOffset: Option[Long] = None
-    var lastOffset = -1L
-    var sourceCodec: CompressionCodec = NoCompressionCodec
-    var monotonic = true
-    var maxTimestamp = RecordBatch.NO_TIMESTAMP
-    var offsetOfMaxTimestamp = -1L
+    var shallowMessageCount = 0 //记录外层消息的数量
+    var validBytesCount = 0 //记录通过验证的 records 的字节数之和
+    var firstOffset: Option[Long] = None //记录第一条消息的offset
+    var lastOffset = -1L //记录最后一条消息的offset
+    var sourceCodec: CompressionCodec = NoCompressionCodec //消息的压缩方法
+    var monotonic = true //标识生产者为消息分配的内部 offset 是否单调递增，使用浅层迭代器进行迭代，如果是压缩消息，并不会解压缩
+    var maxTimestamp = RecordBatch.NO_TIMESTAMP //最大的时间戳
+    var offsetOfMaxTimestamp = -1L //最大时间戳的offset
     var readFirstMessage = false
     var lastOffsetOfFirstBatch = -1L
 
@@ -1941,6 +1944,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
     val maxTimestampInMessages = appendInfo.maxTimestamp
     val maxOffsetInMessages = appendInfo.lastOffset
 
+    // 在shouldRoll 方法中 判断是否需要创建一个 segment
     if (segment.shouldRoll(RollParams(config, appendInfo, messagesSize, now))) {
       debug(s"Rolling new log segment (log_size = ${segment.size}/${config.segmentSize}}, " +
         s"offset_index_size = ${segment.offsetIndex.entries}/${segment.offsetIndex.maxEntries}, " +
@@ -1960,10 +1964,13 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
         in the header.
       */
       appendInfo.firstOffset match {
+          //创建新的activeSegment 调用 roll 方法
+          //这里的 activeSegment 其实就是 LogSegment，由于是Kafka 是顺序添加的，所以最后一个LogSegment 就是正在被添加 record 的 Segment 称作为 activeSegment
         case Some(firstOffset) => roll(Some(firstOffset))
         case None => roll(Some(maxOffsetInMessages - Integer.MAX_VALUE))
       }
     } else {
+      //通过上面的 shouldRoll 方法得出不需要重新创建activeSegment ，则直接返回
       segment
     }
   }
@@ -1977,9 +1984,11 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
   def roll(expectedNextOffset: Option[Long] = None): LogSegment = {
     maybeHandleIOException(s"Error while rolling log segment for $topicPartition in dir ${dir.getParent}") {
       val start = time.hiResClockMs()
-      lock synchronized {
+      lock synchronized { // 加锁 多Handler 线程操作会引发线程问题
         checkIfMemoryMappedBufferClosed()
+        //获取 LEO： LEO是即将要插入的数据 log end offset
         val newOffset = math.max(expectedNextOffset.getOrElse(0L), logEndOffset)
+        //新日志文件的文件名是 [LEO].log
         val logFile = Log.logFile(dir, newOffset)
 
         if (segments.containsKey(newOffset)) {
@@ -2022,6 +2031,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
         producerStateManager.updateMapEndOffset(newOffset)
         producerStateManager.takeSnapshot()
 
+        //新创建的LogSegment
         val segment = LogSegment.open(dir,
           baseOffset = newOffset,
           config,
@@ -2029,18 +2039,21 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
           fileAlreadyExists = false,
           initFileSize = initFileSize,
           preallocate = config.preallocate)
+        //将新创建的Segment 添加到 segments 这个跳表中。
         addSegment(segment)
 
         // We need to update the segment base offset and append position data of the metadata when log rolls.
         // The next offset should not change.
+        //更新 nextOffsetMetadata 这次更新的目的是为了更新其中记录的 activeSegment.baseOffset 和 activeSegment.size ，而 LEO 并不会改变。
         updateLogEndOffset(nextOffsetMetadata.messageOffset)
 
         // schedule an asynchronous flush of the old segment
+        //定时任务 执行flush 操作
         scheduler.schedule("flush-log", () => flush(newOffset), delay = 0L)
 
         info(s"Rolled new log segment at offset $newOffset in ${time.hiResClockMs() - start} ms.")
 
-        segment
+        segment //返回新建的 activeSegment
       }
     }
   }
@@ -2052,6 +2065,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
 
   /**
    * Flush all log segments
+   * 会把 recoverPoint ~ LEO 之间的消息数据刷新到磁盘上，并修改reoverPoint 值
    */
   def flush(): Unit = flush(this.logEndOffset)
 
@@ -2062,18 +2076,21 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
    */
   def flush(offset: Long): Unit = {
     maybeHandleIOException(s"Error while flushing log for $topicPartition in dir ${dir.getParent} with offset $offset") {
+      //offset 之前的消息已经全部刷新到磁盘，所以不需要刷新直接返回
       if (offset <= this.recoveryPoint)
         return
       debug(s"Flushing log up to offset $offset, last flushed: $lastFlushTime,  current time: ${time.milliseconds()}, " +
         s"unflushed: $unflushedMessages")
+      //logSegment 方法，通过推 segments 这个跳表的操作，查找到 recoverPoint 和 offset 之间的 LogSegment 对象
       for (segment <- logSegments(this.recoveryPoint, offset))
+        //调用 LogSegment.flush 方法会调用日志文件和索引文件的flush方法，最终调用操作系统的fsync 命令刷新磁盘，保证数据持久性。
         segment.flush()
 
       lock synchronized {
         checkIfMemoryMappedBufferClosed()
         if (offset > this.recoveryPoint) {
-          this.recoveryPoint = offset
-          lastFlushedTime.set(time.milliseconds)
+          this.recoveryPoint = offset //更新recoveryPoint
+          lastFlushedTime.set(time.milliseconds) //修改 lastFlushedTime 时间
         }
       }
     }
