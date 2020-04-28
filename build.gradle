@@ -716,6 +716,7 @@ project(':core') {
     // only needed transitively, but set it explicitly to ensure it has the same version as scala-library
     compile libs.scalaReflect
     compile libs.scalaLogging
+    compile libs.slf4jlog4j
     compile libs.slf4jApi
     compile(libs.zookeeper) {
       exclude module: 'slf4j-log4j12'
