@@ -1102,7 +1102,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
       val appendInfo = analyzeAndValidateRecords(records, origin)
 
       // return if we have no valid messages or if this is a duplicate of the last appended entry
-      // 如果压根就不需要写入任何消息，直接返回即可
+      // 如果压根就不需要写入任何消息，直接返回即可(也就是说在第①步中没有发现有message 这个这里 shallowCount 是0)
       if (appendInfo.shallowCount == 0)
         return appendInfo
 
@@ -1427,6 +1427,12 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
       // When appending to the leader, we will update LogAppendInfo.baseOffset with the correct value. In the follower
       // case, validation will be more lenient.
       // Also indicate whether we have the accurate first offset or not
+
+      //一开始readFirstMessage 是 false 会去获取这个 batch 的baseOffset。
+      //这里有两种获取方式：
+      //1. 如果是老版本的kafka 那么通过这个batch的 lastOffset。
+      //2. 如果是新版本的 >= v2，那么在Batch的Header 里面就有这个baseOffset，可以直接获取
+      //然后修改 readFirstMessage 为true
       if (!readFirstMessage) {
         if (batch.magic >= RecordBatch.MAGIC_VALUE_V2)
           firstOffset = Some(batch.baseOffset) // 更新firstOffset字段
@@ -1503,12 +1509,14 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
    * @return A trimmed message set. This may be the same as what was passed in or it may not.
    */
   private def trimInvalidBytes(records: MemoryRecords, info: LogAppendInfo): MemoryRecords = {
+    //写入消息总字节数
     val validBytes = info.validBytes
     if (validBytes < 0)
       throw new CorruptRecordException(s"Cannot append record batch with illegal length $validBytes to " +
         s"log for $topicPartition. A possible cause is a corrupted produce request.")
     if (validBytes == records.sizeInBytes) {
       records
+      //超过部分就会被截断
     } else {
       // trim invalid bytes
       val validByteBuffer = records.buffer.duplicate()
