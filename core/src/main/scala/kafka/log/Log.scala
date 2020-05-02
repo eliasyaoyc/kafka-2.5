@@ -308,7 +308,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
     val startMs = time.milliseconds
 
     // create the log directory if it doesn't exist
-    //① 创建log文件，如果不存在就创建。通过dir属性
+    //① 创建log目录，如果不存在就创建。通过dir属性
     Files.createDirectories(dir.toPath)
 
     //② 初始化 Leader Epoch Cache
@@ -510,6 +510,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
   def recordVersion: RecordVersion = config.messageFormatVersion.recordVersion
 
   private def initializeLeaderEpochCache(): Unit = lock synchronized {
+    //① 创建 leader-epoch-checkpoint 文件
     val leaderEpochFile = LeaderEpochCheckpointFile.newFile(dir)
 
     def newLeaderEpochFileCache(): LeaderEpochFileCache = {
@@ -517,6 +518,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
       new LeaderEpochFileCache(topicPartition, logEndOffset _, checkpointFile)
     }
 
+    //② 实例化 LeaderEpochFileCache 对象，此对象用来缓存 tp 和 leo的关系
     if (recordVersion.precedes(RecordVersion.V2)) {
       val currentCache = if (leaderEpochFile.exists())
         Some(newLeaderEpochFileCache())
@@ -564,7 +566,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
         debug(s"Deleting stray temporary file ${file.getAbsolutePath}")
         Files.deleteIfExists(file.toPath) // 说明是上次Failure遗留下来的文件，直接删除
       } else if (filename.endsWith(CleanedFileSuffix)) { // 如果以.cleaned结尾
-        //// 选取文件名中位移值最小的.cleaned文件，获取其位移值，并将该文件加入待删除文件集合中
+        // 选取文件名中位移值最小的.cleaned文件，获取其位移值，并将该文件加入待删除文件集合中
         minCleanedFileOffset = Math.min(offsetFromFileName(filename), minCleanedFileOffset)
         cleanFiles += file
       } else if (filename.endsWith(SwapFileSuffix)) { // 如果以.swap结尾
