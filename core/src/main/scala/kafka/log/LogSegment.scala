@@ -146,9 +146,9 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
    */
   @nonthreadsafe
-  def append(largestOffset: Long, //在这个分段中最大的offset
+  def append(largestOffset: Long, //在这个分段中最大的位移量
              largestTimestamp: Long,//在这个分段中最大的时间戳
-             shallowOffsetOfMaxTimestamp: Long,
+             shallowOffsetOfMaxTimestamp: Long,//外层消息中最大的时间戳的位移量
              records: MemoryRecords): Unit = {//要追加的日志条目
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
@@ -340,15 +340,23 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
    * @throws LogSegmentOffsetOverflowException if the log segment contains an offset that causes the index offset to overflow
    */
   @nonthreadsafe
+  //是根据日志文件重建索引文件，同时验证日志文件中消息的合法性。
+  //在重新索引文件过程中，如果遇到了压缩消息需要进行解压，主要原因是因为索引项中保存的相对offset是第一条消息的offset
+  //而外层消息的offset是压缩消息集合中的最后一条消息的offset
   def recover(producerStateManager: ProducerStateManager, leaderEpochCache: Option[LeaderEpochFileCache] = None): Int = {
+    //① 分别调用 offsetIndex、timeIndex、txnIndex 索引的reset 方法，清空索引文件，并且移动 position 指针
     offsetIndex.reset()
     timeIndex.reset()
     txnIndex.reset()
+    // 记录了已经通过验证的字节数
     var validBytes = 0
+    // 最后一个索引项对应的物理地址
     var lastIndexEntry = 0
+    // 最大的时间戳
     maxTimestampSoFar = RecordBatch.NO_TIMESTAMP
     try {
       for (batch <- log.batches.asScala) {
+        //② 验证message 是否合法，验证失败就抛异常
         batch.ensureValid()
         ensureOffsetInRange(batch.lastOffset)
 
@@ -359,7 +367,9 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
         }
 
         // Build offset index
+        // 开始构建索引项
         if (validBytes - lastIndexEntry > indexIntervalBytes) {
+          //③ 构建offsetIndex timeIndex 索引
           offsetIndex.append(batch.lastOffset, validBytes)
           timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
           lastIndexEntry = validBytes
@@ -383,6 +393,7 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
     if (truncated > 0)
       debug(s"Truncated $truncated invalid bytes at the end of segment ${log.file.getAbsoluteFile} during recovery")
 
+    //④ 截断验证失败的日志，对索引文件进行相对应的截断
     log.truncateTo(validBytes)
     offsetIndex.trimToValidSize()
     // A normally closed segment always appends the biggest timestamp ever seen into log segment, we do this as well.
