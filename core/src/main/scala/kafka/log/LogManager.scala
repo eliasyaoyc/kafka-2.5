@@ -48,18 +48,19 @@ import scala.util.{Failure, Success, Try}
 @threadsafe
 class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties 配置文件中通过log.dirs 项指定的多个目录。每个目录下可以创建多个Log，每个log 都有自己对应的目录，LogManager 在创建Log时会选择Log最少的log目录创建Log
                  initialOfflineDirs: Seq[File],
+                 //topic的一些信息，从zk中读取
                  val topicConfigs: Map[String, LogConfig], // note that this doesn't get updated after creation
-                 val initialDefaultConfig: LogConfig,
-                 val cleanerConfig: CleanerConfig,
-                 recoveryThreadsPerDataDir: Int,
-                 val flushCheckMs: Long,
-                 val flushRecoveryOffsetCheckpointMs: Long,
-                 val flushStartOffsetCheckpointMs: Long,
-                 val retentionCheckMs: Long,
-                 val maxPidExpirationMs: Int,
-                 scheduler: Scheduler,
-                 val brokerState: BrokerState,
-                 brokerTopicStats: BrokerTopicStats,
+                 val initialDefaultConfig: LogConfig,//Kafka关于 Log 的一些配置比如：分段大小，flush间隔时间，日志清理的配置等。
+                 val cleanerConfig: CleanerConfig,//cleaner 线程的配置
+                 recoveryThreadsPerDataDir: Int,//在Kafka启动的时候处理日志恢复，关闭的时候处理日志flush的线程数量。默认为1个，可以通过`num.recovery.threads.per.data.dir`进行配置。
+                 val flushCheckMs: Long, //从内存刷新到磁盘的间隔时间，通过 `log.flush.scheduler.interval.ms` 进行配置，默认 `Long.MaxValue`
+                 val flushRecoveryOffsetCheckpointMs: Long,//更新日志恢复点的频率，通过 `log.flush.offset.checkpoint.interval.ms` 进行配置，默认 `60000ms`
+                 val flushStartOffsetCheckpointMs: Long, //更新日志`Log Start Offset `的频率，通过`log.flush.start.offset.checkpoint.interval.ms` 进行配置，默认`60000ms`
+                 val retentionCheckMs: Long,//检查日志是否有过期的频率，通过 `log.retention.check.interval.ms` 进行配置，默认 `5 * 60 * 1000Lms`
+                 val maxPidExpirationMs: Int, //transactional id 过期的时间，通过 `transactional.id.expiration.ms` 进行配置，默认`7天`
+                 scheduler: Scheduler, //定时器，用的是Java中的 `ScheduledThreadPoolExecutor` 对象
+                 val brokerState: BrokerState, //broker的状态，有 `NotRunning`、`Starting`、`RecoveringFromUncleanShutdown`、`RunningAsBroker`、`PendingControlledShutdown`、`BrokerShuttingDown` 这几种状态。
+                 brokerTopicStats: BrokerTopicStats,//broker中topic 的状态
                  logDirFailureChannel: LogDirFailureChannel,
                  time: Time) extends Logging with KafkaMetricsGroup {
 
@@ -69,14 +70,18 @@ class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties �
   val InitialTaskDelayMs = 30 * 1000
 
   private val logCreationOrDeletionLock = new Object
+  //用于管理 `TopicAndPartition` 与 `Log` 之间的对应关系。使用的是Kafka自定义的 `pool` 类型对象，底层是jdk 提供的 `ConcurrentHashMap`
   private val currentLogs = new Pool[TopicPartition, Log]()
   // Future logs are put in the directory with "-future" suffix. Future log is created when user wants to move replica
   // from one log directory to another log directory on the same broker. The directory of the future log will be renamed
   // to replace the current log of the partition after the future log catches up with the current log
   private val futureLogs = new Pool[TopicPartition, Log]()
   // Each element in the queue contains the log object to be deleted and the time it is scheduled for deletion.
+  //需要被删除的日志的集合，使用jdk 提供的 `LinkedBlockingQueue`
   private val logsToBeDeleted = new LinkedBlockingQueue[(Log, Long)]()
 
+  //创建或者获取 log.dirs 项指定的多个目录
+  //要求：没有重复，都是可读的
   private val _liveLogDirs: ConcurrentLinkedQueue[File] = createAndValidateLogDirs(logDirs, initialOfflineDirs)
   @volatile private var _currentDefaultConfig = initialDefaultConfig
   @volatile private var numRecoveryThreadsPerDataDir = recoveryThreadsPerDataDir
@@ -964,18 +969,22 @@ class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties �
     val deletableLogs = {
       if (cleaner != null) {
         // prevent cleaner from working on same partitions when changing cleanup policy
+        //① 先中断当前 topic-partition 下正在进行执行cleaner的线程
         cleaner.pauseCleaningForNonCompactedPartitions()
       } else {
+        //② 过滤掉 cleanup.policy 配置的不是 delete 的 log
         currentLogs.filter {
           case (_, log) => !log.config.compact
         }
       }
     }
 
+    //到这里了 deletableLogs 中log的cleanup.policy 配置是delete，开始进行删除
     try {
       deletableLogs.foreach {
         case (topicPartition, log) =>
           debug(s"Garbage collecting '${log.name}'")
+          //③ 委托给 log.deleteOldSegments() 方法
           total += log.deleteOldSegments()
 
           val futureLog = futureLogs.get(topicPartition)
@@ -986,6 +995,7 @@ class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties �
           }
       }
     } finally {
+      //④ 如果在第①步中中断了cleaner 线程，则在这里进行恢复。也就是说在topic-partition的同一时刻 只有一个cleaner 对其进行清理
       if (cleaner != null) {
         cleaner.resumeCleaning(deletableLogs.map(_._1))
       }
@@ -1029,11 +1039,15 @@ class LogManager(logDirs: Seq[File],//log 目录集合：在server.properties �
   private def flushDirtyLogs(): Unit = {
     debug("Checking for dirty logs to flush...")
 
+    //① 遍历 currentLogs 和  futureLogs 集合
     for ((topicPartition, log) <- currentLogs.toList ++ futureLogs.toList) {
       try {
+        //② 计算上一次flush 的时间与当前时间做比较
         val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
         debug(s"Checking if flush is needed on ${topicPartition.topic} flush interval ${log.config.flushMs}" +
               s" last flushed ${log.lastFlushTime} time since last flush: $timeSinceLastFlush")
+        //③ 如果满足 flush.ms 配置的时间，则调用flush 方法 刷新到磁盘上
+        //会把 recoverPoint ~ LEO 之间的消息数据刷新到磁盘上，并修改recoverPoint 值
         if(timeSinceLastFlush >= log.config.flushMs)
           log.flush
       } catch {

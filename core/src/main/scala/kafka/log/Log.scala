@@ -2075,7 +2075,7 @@ class Log(@volatile var dir: File, // dir 就是这个日志所在的文件夹�
 
   /**
    * Flush all log segments
-   * 会把 recoverPoint ~ LEO 之间的消息数据刷新到磁盘上，并修改reoverPoint 值
+   * 会把 recoverPoint ~ LEO 之间的消息数据刷新到磁盘上，并修改recoverPoint 值
    */
   def flush(): Unit = flush(this.logEndOffset)
 

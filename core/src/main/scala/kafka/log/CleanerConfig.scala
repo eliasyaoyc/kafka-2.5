@@ -29,13 +29,13 @@ package kafka.log
  * @param enableCleaner Allows completely disabling the log cleaner
  * @param hashAlgorithm The hash algorithm to use in key comparison.
  */
-case class CleanerConfig(numThreads: Int = 1,
-                         dedupeBufferSize: Long = 4*1024*1024L,
-                         dedupeBufferLoadFactor: Double = 0.9d,
+case class CleanerConfig(numThreads: Int = 1, //启动多少个 cleaner 线程
+                         dedupeBufferSize: Long = 4*1024*1024L, //用于日志重复数据删除的总内存 4mb
+                         dedupeBufferLoadFactor: Double = 0.9d, //重复数据删除缓冲区的最大已用百分比
                          ioBufferSize: Int = 1024*1024,
-                         maxMessageSize: Int = 32*1024*1024,
-                         maxIoBytesPerSecond: Double = Double.MaxValue,
-                         backOffMs: Long = 15 * 1000,
-                         enableCleaner: Boolean = true,
-                         hashAlgorithm: String = "MD5") {
+                         maxMessageSize: Int = 32*1024*1024, //日志中可以显示的消息的最大大小
+                         maxIoBytesPerSecond: Double = Double.MaxValue, //允许所有 cleaner 线程执行的最大读写I / O
+                         backOffMs: Long = 15 * 1000,//如果没有可清除的日志则等待的时间
+                         enableCleaner: Boolean = true, //是否开启cleaner 线程
+                         hashAlgorithm: String = "MD5") { //key 比较的算法
 }
