@@ -166,14 +166,18 @@ private[log] class LogCleanerManager(val logDirs: Seq[File],
     */
   def grabFilthiestCompactedLog(time: Time, preCleanStats: PreCleanStats = new PreCleanStats()): Option[LogToClean] = {
     inLock(lock) {
+      //当前时间
       val now = time.milliseconds
+      //监控指标 记录 cleaner 线程跑的时间
       this.timeOfLastRun = now
       val lastClean = allCleanerCheckpoints
       val dirtyLogs = logs.filter {
+        //过滤掉 cleaner.policy 不是 compact 的log
         case (_, log) => log.config.compact  // match logs that are marked as compacted
       }.filterNot {
         case (topicPartition, log) =>
           // skip any logs already in-progress and uncleanable partitions
+          // 过滤掉已经 in-progress 集合中的 不需要清理的
           inProgress.contains(topicPartition) || isUncleanablePartition(log, topicPartition)
       }.map {
         case (topicPartition, log) => // create a LogToClean instance for each

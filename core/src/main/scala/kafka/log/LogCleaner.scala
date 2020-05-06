@@ -137,6 +137,7 @@ class LogCleaner(initialConfig: CleanerConfig,
 
   /**
    * Start the background cleaning
+   * 启动CleanerThread 线程
    */
   def startup(): Unit = {
     info("Starting the log cleaner")
@@ -486,6 +487,7 @@ private[log] class Cleaner(val id: Int, //线程 id
   private[log] def clean(cleanable: LogToClean): (Long, CleanerStats) = {
     // figure out the timestamp below which it is safe to remove delete tombstones
     // this position is defined to be a configurable time beneath the last modified time of the last clean segment
+    //计算可以安全删除 "删除标识" (即value 为空的消息) 的logSegment
     val deleteHorizonMs =
       cleanable.log.logSegments(0, cleanable.firstDirtyOffset).lastOption match {
         case None => 0L
@@ -512,7 +514,6 @@ private[log] class Cleaner(val id: Int, //线程 id
 
     // determine the timestamp up to which the log will be cleaned
     // this is the lower of the last active segment and the compaction lag
-    //③ 计算可以安全删除 "删除标识" (即value 为空的消息) 的logSegment
     val cleanableHorizonMs = log.logSegments(0, cleanable.firstUncleanableOffset).lastOption.map(_.lastModified).getOrElse(0L)
 
     // group the segments and clean the groups
@@ -523,6 +524,7 @@ private[log] class Cleaner(val id: Int, //线程 id
     val groupedSegments = groupSegmentsBySize(log.logSegments(0, endOffset), log.config.segmentSize,
       log.config.maxIndexSize, cleanable.firstUncleanableOffset)
     for (group <- groupedSegments)
+      //删除segment
       cleanSegments(log, group, offsetMap, deleteHorizonMs, stats, transactionMetadata)
 
     // record buffer utilization
@@ -551,6 +553,7 @@ private[log] class Cleaner(val id: Int, //线程 id
                                  stats: CleanerStats,
                                  transactionMetadata: CleanedTransactionMetadata): Unit = {
     // create a new segment with a suffix appended to the name of the log and indexes
+    //创建 ".clean" 后缀的日志文件和索引文件，文件名是分组中第一个 logSegment 的 baseOffset
     val cleaned = LogCleaner.createNewCleanedSegment(log, segments.head.baseOffset)
     transactionMetadata.cleanedIndex = Some(cleaned.txnIndex)
 
@@ -575,6 +578,7 @@ private[log] class Cleaner(val id: Int, //线程 id
           s"${if(retainDeletesAndTxnMarkers) "retaining" else "discarding"} deletes.")
 
         try {
+          //进行日志压缩操作
           cleanInto(log.topicPartition, currentSegment.log, cleaned, map, retainDeletesAndTxnMarkers, log.config.maxMessageSize,
             transactionMetadata, lastOffsetOfActiveProducers, stats)
         } catch {
@@ -590,14 +594,20 @@ private[log] class Cleaner(val id: Int, //线程 id
 
       cleaned.onBecomeInactiveSegment()
       // flush new segment to disk before swap
+      //执行flush 操作，将数据刷新到磁盘上
       cleaned.flush()
 
       // update the modification date to retain the last modified date of the original files
+      //更新最后的修改时间
       val modified = segments.last.lastModified
       cleaned.lastModified = modified
 
       // swap in new segment
       info(s"Swapping in cleaned segment $cleaned for segment(s) $segments in log $log")
+      //将.clean 后缀改为 .swap 后缀
+      //将 cleaned 对象加入到 segments 中
+      //将分组中的 logSegment 从 segments 中删除
+      //最后将文件的 .swap 后缀删除
       log.replaceSegments(List(cleaned), segments)
     } catch {
       case e: LogCleaningAbortedException =>
@@ -671,14 +681,18 @@ private[log] class Cleaner(val id: Int, //线程 id
     }
 
     var position = 0
+    // 遍历待压缩的 LogSegment
     while (position < sourceRecords.sizeInBytes) {
+      //检查压缩状态
       checkDone(topicPartition)
       // read a chunk of messages and copy any that are to be retained to the write buffer to be written out
       readBuffer.clear()
       writeBuffer.clear()
 
+      //读取消息
       sourceRecords.readInto(readBuffer, position)
       val records = MemoryRecords.readableRecords(readBuffer)
+      //是否限制读取速率
       throttler.maybeThrottle(records.sizeInBytes)
       val result = records.filterTo(topicPartition, logCleanerFilter, writeBuffer, maxLogMessageSize, decompressionBufferSupplier)
       stats.readMessages(result.messagesRead, result.bytesRead)
@@ -702,9 +716,11 @@ private[log] class Cleaner(val id: Int, //线程 id
 
       // if we read bytes but didn't get even one complete batch, our I/O buffer is too small, grow it and try again
       // `result.bytesRead` contains bytes from `messagesRead` and any discarded batches.
+      // 未读取一个完整的消息，表示 readBuffer 过小，需要扩容
       if (readBuffer.limit() > 0 && result.bytesRead == 0)
         growBuffersOrFail(sourceRecords, position, maxLogMessageSize, records)
     }
+    //重置 readBuffer 和 writeBuffer
     restoreBuffers()
   }
 
@@ -883,6 +899,7 @@ private[log] class Cleaner(val id: Int, //线程 id
     }
     info("Building offset map for log %s for %d segments in offset range [%d, %d).".format(log.name, dirty.size, start, end))
 
+    //事务有关
     val transactionMetadata = new CleanedTransactionMetadata
     val abortedTransactions = log.collectAbortedTransactions(start, end)
     transactionMetadata.addAbortedTransactions(abortedTransactions)
@@ -966,10 +983,12 @@ private[log] class Cleaner(val id: Int, //线程 id
           map.updateLatestOffset(batch.lastOffset)
       }
       val bytesRead = records.validBytes
+      //移动position 准备下次读取
       position += bytesRead
       stats.indexBytesRead(bytesRead)
 
       // if we didn't read even one complete message, our read buffer may be too small
+      //如果position 没有移动表示没有读取到一个完整的 message， 则对 readbuffer writebuffer进行扩容
       if(position == startPosition)
         growBuffersOrFail(segment.log, position, maxLogMessageSize, records)
     }
@@ -977,6 +996,7 @@ private[log] class Cleaner(val id: Int, //线程 id
     // In the case of offsets gap, fast forward to latest expected offset in this segment.
     map.updateLatestOffset(nextSegmentStartOffset - 1L)
 
+    //重置readbuffer writebuffer 大小
     restoreBuffers()
     false
   }
