@@ -672,10 +672,15 @@ private[log] class Cleaner(val id: Int, //线程 id
       }
 
       override def shouldRetainRecord(batch: RecordBatch, record: Record): Boolean = {
+        //调用上面的 checkBatchRetention 方法判断是否要丢弃。
         if (discardBatchRecords)
           // The batch is only retained to preserve producer sequence information; the records can be removed
           false
         else
+          //是否保存这个消息，有三个条件
+          //1.此消息是否含有key
+          //2.offsetMap中是否有相同的key
+          //3.value 不为空 或者 value 为空但是现在不可以删除。
           Cleaner.this.shouldRetainRecord(map, retainDeletesAndTxnMarkers, batch, record, stats)
       }
     }

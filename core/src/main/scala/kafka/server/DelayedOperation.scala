@@ -46,7 +46,9 @@ abstract class DelayedOperation(override val delayMs: Long,
                                 lockOpt: Option[Lock] = None)
   extends TimerTask with Logging {
 
+  //用来表示 TimerTask 是否完成
   private val completed = new AtomicBoolean(false)
+  //用来表示 TimerTask 正在执行 maybeTryComplete 方法，尝试完成
   private val tryCompletePending = new AtomicBoolean(false)
   // Visible for testing
   private[server] val lock: Lock = lockOpt.getOrElse(new ReentrantLock)
@@ -164,14 +166,15 @@ object DelayedOperationPurgatory {
  * A helper purgatory class for bookkeeping delayed operations with a timeout, and expiring timed out operations.
  */
 final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: String,
-                                                             timeoutTimer: Timer,
+                                                             timeoutTimer: Timer,//systemTimer对象
                                                              brokerId: Int = 0,
-                                                             purgeInterval: Int = 1000,
+                                                             purgeInterval: Int = 1000,//systemTimer对象
                                                              reaperEnabled: Boolean = true,
                                                              timerEnabled: Boolean = true)
         extends Logging with KafkaMetricsGroup {
   /* a list of operation watching keys */
   private class WatcherList {
+    //管理 Watchers 的pool 对象
     val watchersByKey = new Pool[Any, Watchers](Some((key: Any) => new Watchers(key)))
 
     val watchersLock = new ReentrantLock()
@@ -191,9 +194,12 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
   }
 
   // the number of estimated total operations in the purgatory
+  //记录了该 DelayedOperationPurgatory 中的 DelayedOperation个数
   private[this] val estimatedTotalOperations = new AtomicInteger(0)
 
   /* background thread expiring operations that have timed out */
+  //一个ShutdownableThread 线程对象，主要有两个功能，一个是推进时间轮表针，二是定期清理watchersForKey 中已完成的 DelayedOperation。
+  //清理条件有 purgeInterval 字段指定。
   private val expirationReaper = new ExpiredOperationReaper()
 
   private val metricsTags = Map("delayedOperation" -> purgatoryName)
@@ -366,16 +372,19 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
     }
 
     // traverse the list and try to complete some watched elements
+    // 遍历 operations 集合 对里面未完成的 operation 执行 tryComplete 方法尝试完成，将已经完成的移除。
+    // 如果 operations 队列为空，则将 Watchers 从 DelayedOperationPurgatory.watchersForKey 中删除
     def tryCompleteWatched(): Int = {
       var completed = 0
 
       val iter = operations.iterator()
-      while (iter.hasNext) {
+      while (iter.hasNext) {//遍历
         val curr = iter.next()
-        if (curr.isCompleted) {
+        if (curr.isCompleted) {//完成则移除
           // another thread has completed this operation, just remove it
           iter.remove()
-        } else if (curr.maybeTryComplete()) {
+        } else if (curr.maybeTryComplete()) {//尝试完成
+          //成功移除
           iter.remove()
           completed += 1
         }
@@ -400,6 +409,8 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
     }
 
     // traverse the list and purge elements that are already completed by others
+    //负责清理 operations 队列， 将已经完成的 DelayOperation 从 operations 队列中移除，
+    //如果 operations 队列为空，则将Watchers从watcherForKey集合中删除
     def purgeCompleted(): Int = {
       var purged = 0
 
@@ -420,11 +431,15 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
   }
 
   def advanceClock(timeoutMs: Long): Unit = {
+    //尝试推进时间轮的表针
     timeoutTimer.advanceClock(timeoutMs)
 
     // Trigger a purge if the number of completed but still being watched operations is larger than
     // the purge threshold. That number is computed by the difference btw the estimated total number of
     // operations and the number of pending delayed operations.
+
+    // DelayedOperation 到期后 被Systemer.taskExecutor完成后，并不会通知 DelayedOperationPurgatory 删除DelayedOperation
+    // DelayedOperationPurgatory 与 SystemTimer 中的 DelayedOperation 数量相差到一个阈值时，会调用 purgeCompleted 方法执行清理工作
     if (estimatedTotalOperations.get - numDelayed > purgeInterval) {
       // now set estimatedTotalOperations to delayed (the number of pending operations) since we are going to
       // clean up watchers. Note that, if more operations are completed during the clean up, we may end up with
@@ -446,6 +461,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
     false) {
 
     override def doWork(): Unit = {
+      //最长堵塞时间200ms
       advanceClock(200L)
     }
   }

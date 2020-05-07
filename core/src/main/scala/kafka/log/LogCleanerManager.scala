@@ -182,6 +182,7 @@ private[log] class LogCleanerManager(val logDirs: Seq[File],
       }.map {
         case (topicPartition, log) => // create a LogToClean instance for each
           try {
+            //计算出 firstDirtyOffset， firstDirtyOffset 的值可能是 logStartOffset 也可能是 clean checkpoint
             val lastCleanOffset = lastClean.get(topicPartition)
             val (firstDirtyOffset, firstUncleanableDirtyOffset) = cleanableOffsets(log, lastCleanOffset, now)
             val compactionDelayMs = maxCompactionDelay(log, firstDirtyOffset, now)

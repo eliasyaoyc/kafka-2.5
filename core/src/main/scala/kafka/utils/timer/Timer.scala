@@ -58,14 +58,18 @@ class SystemTimer(executorName: String,
                   startMs: Long = Time.SYSTEM.hiResClockMs) extends Timer {
 
   // timeout timer
+  //jdk 提供的固定线程池
   private[this] val taskExecutor = Executors.newFixedThreadPool(1,
     (runnable: Runnable) => KafkaThread.nonDaemon("executor-" + executorName, runnable))
 
+  //各个层级的时间轮共用的 DelayQueue 队列，主要作用是堵塞推进时间轮表针的线程(ExpiredOperationReaper)，等待最近到期的任务到期。
   private[this] val delayQueue = new DelayQueue[TimerTaskList]()
+  //各个层级时间轮共用的任务个数计数器
   private[this] val taskCounter = new AtomicInteger(0)
+  //最底层的时间轮
   private[this] val timingWheel = new TimingWheel(
-    tickMs = tickMs,
-    wheelSize = wheelSize,
+    tickMs = tickMs,//1
+    wheelSize = wheelSize,//20
     startMs = startMs,
     taskCounter = taskCounter,
     delayQueue
@@ -76,6 +80,7 @@ class SystemTimer(executorName: String,
   private[this] val readLock = readWriteLock.readLock()
   private[this] val writeLock = readWriteLock.writeLock()
 
+  //添加任务，如果任务未到期，则调用TimeWheel 的add 方法添加到时间轮中等待后期执行。
   def add(timerTask: TimerTask): Unit = {
     readLock.lock()
     try {
@@ -86,9 +91,11 @@ class SystemTimer(executorName: String,
   }
 
   private def addTimerTaskEntry(timerTaskEntry: TimerTaskEntry): Unit = {
+    //向时间轮提交添加任务失败，任务可能已经到期或已经取消
     if (!timingWheel.add(timerTaskEntry)) {
       // Already expired or cancelled
       if (!timerTaskEntry.cancelled)
+        //将到期任务提交到 taskExecutor 执行
         taskExecutor.submit(timerTaskEntry.timerTask)
     }
   }
@@ -100,14 +107,18 @@ class SystemTimer(executorName: String,
    * waits up to timeoutMs before giving up.
    */
   def advanceClock(timeoutMs: Long): Boolean = {
+    //堵塞等待
     var bucket = delayQueue.poll(timeoutMs, TimeUnit.MILLISECONDS)
+    //在堵塞期间，有TimerTaskList 到期
     if (bucket != null) {
       writeLock.lock()
       try {
         while (bucket != null) {
-          timingWheel.advanceClock(bucket.getExpiration())
+          timingWheel.advanceClock(bucket.getExpiration())//推进时间轮表针
+          //尝试将 bucket 中的任务重新添加到时间轮，此过程不一定是将任务提交给 taskExecutor 执行，
+          //对未到期的任务只是从原来的时间轮降级到下层时间轮继续等待
           bucket.flush(reinsert)
-          bucket = delayQueue.poll()
+          bucket = delayQueue.poll()//不会堵塞
         }
       } finally {
         writeLock.unlock()
