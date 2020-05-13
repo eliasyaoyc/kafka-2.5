@@ -198,7 +198,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
   private[this] val estimatedTotalOperations = new AtomicInteger(0)
 
   /* background thread expiring operations that have timed out */
-  //一个ShutdownableThread 线程对象，主要有两个功能，一个是推进时间轮表针，二是定期清理watchersForKey 中已完成的 DelayedOperation。
+  //一个ShutdownableThread 线程对象，主要有两个功能，一个是推进时间轮表针，二是定期清理watchersByKey 中已完成的 DelayedOperation。
   //清理条件有 purgeInterval 字段指定。
   private val expirationReaper = new ExpiredOperationReaper()
 
@@ -221,6 +221,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
    * @param operation the delayed operation to be checked
    * @param watchKeys keys for bookkeeping the operation
    * @return true iff the delayed operations can be completed by the caller
+   * 检查DelayedOperation 是否已经完成，若未完成则添加到 watchersByKey 以及 SystemTimer 中。
    */
   def tryCompleteElseWatch(operation: T, watchKeys: Seq[Any]): Boolean = {
     assert(watchKeys.nonEmpty, "The watch key list can't be empty")
@@ -237,11 +238,13 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
 
     // At this point the only thread that can attempt this operation is this current thread
     // Hence it is safe to tryComplete() without a lock
+    //尝试完成延迟操作
     var isCompletedByMe = operation.tryComplete()
-    if (isCompletedByMe)
+    if (isCompletedByMe)//已完成，返回
       return true
 
     var watchCreated = false
+    //传入的key 可能是多个，循环把未完成的添加到 watchersByKey
     for(key <- watchKeys) {
       // If the operation is already completed, stop adding it to the rest of the watcher list.
       if (operation.isCompleted)
@@ -250,18 +253,22 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
 
       if (!watchCreated) {
         watchCreated = true
+        //自增
         estimatedTotalOperations.incrementAndGet()
       }
     }
 
+    //第二次尝试完成
     isCompletedByMe = operation.maybeTryComplete()
     if (isCompletedByMe)
       return true
 
     // if it cannot be completed by now and hence is watched, add to the expire queue also
+    //没完成加入 SystemTimer 时间轮
     if (!operation.isCompleted) {
       if (timerEnabled)
         timeoutTimer.add(operation)
+      //完成 删除。
       if (operation.isCompleted) {
         // cancel the timer task
         operation.cancel()
@@ -373,7 +380,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
 
     // traverse the list and try to complete some watched elements
     // 遍历 operations 集合 对里面未完成的 operation 执行 tryComplete 方法尝试完成，将已经完成的移除。
-    // 如果 operations 队列为空，则将 Watchers 从 DelayedOperationPurgatory.watchersForKey 中删除
+    // 如果 operations 队列为空，则将 Watchers 从 DelayedOperationPurgatory.watchersByKey 中删除
     def tryCompleteWatched(): Int = {
       var completed = 0
 
@@ -446,6 +453,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
       // a little overestimated total number of operations.
       estimatedTotalOperations.getAndSet(numDelayed)
       debug("Begin purging watch lists")
+      //调用 watchers.purgeCompleted 方法清理已完成的 DelayedOperation
       val purged = watcherLists.foldLeft(0) {
         case (sum, watcherList) => sum + watcherList.allWatchers.map(_.purgeCompleted()).sum
       }
