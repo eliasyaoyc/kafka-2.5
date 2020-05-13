@@ -79,19 +79,33 @@ class DelayedFetch(delayMs: Long,
    * Case G: The accumulated bytes from all the fetching partitions exceeds the minimum bytes
    * Case H: The high watermark on this broker has changed within a FetchSession, need to propagate to follower (KIP-392)
    * Upon completion, should return whatever data is available for each valid partition
+   *
+   * A) 发生副本迁移，当前节点不在是该分区的leader 副本所在的节点
+   * B) 当前broker 没有可用的副本
+   * C) 当前broker 找不到需要读取的分区
+   * D) 分区在当前broker的脱机日志目录中
+   * E) 当前broker 是leader，但是他的 leader epoch 是旧的，也就是他发生了分布式分区错误
+   * F) 开始读取的offset 不在 activeSegment 中，可能是发生了 log 截断，也有可能是发生了 roll操作产生了新的activeSegment
+   * G) 累计读取的字节数超过最小字节数限制
+   * H) 当前 broker 的 hw 被 FetchSession 改变了。需要传播给 follower
    */
   override def tryComplete(): Boolean = {
     var accumulatedSize = 0
+    //遍历 fetchMetadata 中的所有 partition 的状态
     fetchMetadata.fetchPartitionStatus.foreach {
       case (topicPartition, fetchStatus) =>
+        //获取前面读取log时的结束位置
         val fetchOffset = fetchStatus.startOffsetMetadata
+        //leader epoch
         val fetchLeaderEpoch = fetchStatus.fetchInfo.currentLeaderEpoch
         try {
           if (fetchOffset != LogOffsetMetadata.UnknownOffsetMetadata) {
+            // 查找partition ，找不到就会抛出异常
             val partition = replicaManager.getPartitionOrException(topicPartition,
               expectLeader = fetchMetadata.fetchOnlyLeader)
             val offsetSnapshot = partition.fetchOffsetSnapshot(fetchLeaderEpoch, fetchMetadata.fetchOnlyLeader)
 
+            //更新对应的 LEO HW
             val endOffset = fetchMetadata.fetchIsolation match {
               case FetchLogEnd => offsetSnapshot.logEndOffset
               case FetchHighWatermark => offsetSnapshot.highWatermark
@@ -101,20 +115,27 @@ class DelayedFetch(delayMs: Long,
             // Go directly to the check for Case G if the message offsets are the same. If the log segment
             // has just rolled, then the high watermark offset will remain the same but be on the old segment,
             // which would incorrectly be seen as an instance of Case F.
+
+            // 检查上次读取后 endOffset 是否发生变化，如果没改变，之前读不到足够的数据现在还是读不到，即任务条件依然不满足，
+            // 如果变了，则继续下面的检查，看是否真正满足任务执行条件
             if (endOffset.messageOffset != fetchOffset.messageOffset) {
               if (endOffset.onOlderSegment(fetchOffset)) {
                 // Case F, this can happen when the new fetch operation is on a truncated leader
+                // 情况 F，endOffset 出现减少的情况，跑到了 baseOffset 较小的 Segment 上了，可能是 Leader 副本的 Log 出现了 truncate 操作
                 debug(s"Satisfying fetch $fetchMetadata since it is fetching later segments of partition $topicPartition.")
                 return forceComplete()
               } else if (fetchOffset.onOlderSegment(endOffset)) {
                 // Case F, this can happen when the fetch operation is falling behind the current segment
                 // or the partition has just rolled a new segment
+                //情况 F, 此时 fetchOffset 虽然依然在 endOffset 之前，但是产生了新的 activeSegment ，
+                //fetchOffset 在交旧的LogSegment ，而 endOffset 在 activeSegment 中
                 debug(s"Satisfying fetch $fetchMetadata immediately since it is fetching older segments.")
                 // We will not force complete the fetch request if a replica should be throttled.
                 if (!replicaManager.shouldLeaderThrottle(quota, topicPartition, fetchMetadata.replicaId))
                   return forceComplete()
               } else if (fetchOffset.messageOffset < endOffset.messageOffset) {
                 // we take the partition fetch size as upper bound when accumulating the bytes (skip if a throttled partition)
+                // endOffset 和 fetchOffset 在同一个 LogSegment 中， 且endOffset 向后移动，那就尝试计算累计的字节数
                 val bytesAvailable = math.min(endOffset.positionDiff(fetchOffset), fetchStatus.fetchInfo.maxBytes)
                 if (!replicaManager.shouldLeaderThrottle(quota, topicPartition, fetchMetadata.replicaId))
                   accumulatedSize += bytesAvailable
@@ -123,6 +144,7 @@ class DelayedFetch(delayMs: Long,
 
             if (fetchMetadata.isFromFollower) {
               // Case H check if the follower has the latest HW from the leader
+              // 情况 h ， hw 不一致了
               if (partition.getReplica(fetchMetadata.replicaId)
                 .exists(r => offsetSnapshot.highWatermark.messageOffset > r.lastSentHighWatermark)) {
                 return forceComplete()
@@ -167,6 +189,7 @@ class DelayedFetch(delayMs: Long,
    * Upon completion, read whatever data is available and pass to the complete callback
    */
   override def onComplete(): Unit = {
+    //重新从 log 中读取数据
     val logReadResults = replicaManager.readFromLocalLog(
       replicaId = fetchMetadata.replicaId,
       fetchOnlyFromLeader = fetchMetadata.fetchOnlyLeader,
@@ -177,12 +200,14 @@ class DelayedFetch(delayMs: Long,
       clientMetadata = clientMetadata,
       quota = quota)
 
+    //讲读取结果进行封装
     val fetchPartitionData = logReadResults.map { case (tp, result) =>
       tp -> FetchPartitionData(result.error, result.highWatermark, result.leaderLogStartOffset, result.info.records,
         result.lastStableOffset, result.info.abortedTransactions, result.preferredReadReplica,
         fetchMetadata.isFromFollower && replicaManager.isAddingReplica(tp, fetchMetadata.replicaId))
     }
 
+    //调用回调函数
     responseCallback(fetchPartitionData)
   }
 }

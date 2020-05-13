@@ -190,11 +190,12 @@ case class SimpleAssignmentState(replicas: Seq[Int]) extends AssignmentState
 class Partition(val topicPartition: TopicPartition,
                 val replicaLagTimeMaxMs: Long,
                 interBrokerProtocolVersion: ApiVersion,
-                localBrokerId: Int,
+                localBrokerId: Int, // 当前broker 的id，可以与replicaid比较，从而判断指定的 replica 是否表示本地副本
                 time: Time,
                 stateStore: PartitionStateStore,
                 delayedOperations: DelayedOperations,
                 metadataCache: MetadataCache,
+                // 当前 broker 上的 LogManager
                 logManager: LogManager) extends Logging with KafkaMetricsGroup {
 
   def topic: String = topicPartition.topic
@@ -204,11 +205,14 @@ class Partition(val topicPartition: TopicPartition,
   // The read lock is only required when multiple reads are executed and needs to be in a consistent manner
   private val leaderIsrUpdateLock = new ReentrantReadWriteLock
   private var zkVersion: Int = LeaderAndIsr.initialZKVersion
+  //Leader 副本的年代信息
   @volatile private var leaderEpoch: Int = LeaderAndIsr.initialLeaderEpoch - 1
   // start offset for 'leaderEpoch' above (leader epoch of the current leader for this partition),
   // defined when this broker is leader for partition
   @volatile private var leaderEpochStartOffsetOpt: Option[Long] = None
+  //该分区的 leader 副本的 id
   @volatile var leaderReplicaIdOpt: Option[Int] = None
+  //isr 集合维护了该分区的isr集合，isr 集合是 ar集合的子集
   @volatile var inSyncReplicaIds = Set.empty[Int]
   @volatile var assignmentState: AssignmentState = SimpleAssignmentState(Seq.empty)
 
@@ -475,6 +479,7 @@ class Partition(val topicPartition: TopicPartition,
                  partitionState: LeaderAndIsrPartitionState,
                  correlationId: Int,
                  highWatermarkCheckpoints: OffsetCheckpoints): Boolean = {
+    //加锁
     val (leaderHWIncremented, isNewLeader) = inWriteLock(leaderIsrUpdateLock) {
       // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
       // to maintain the decision maker controller's epoch in the zookeeper path
@@ -506,6 +511,7 @@ class Partition(val topicPartition: TopicPartition,
       // would try to query.
       leaderLog.maybeAssignEpochStartOffset(leaderEpoch, leaderEpochStartOffset)
 
+      //检测 leader 是否发生变化
       val isNewLeader = !isLeader
       val curTimeMs = time.milliseconds
       // initialize lastCaughtUpTime of replicas as well as their lastFetchTimeMs and lastFetchLeaderLogEndOffset.
@@ -532,6 +538,7 @@ class Partition(val topicPartition: TopicPartition,
     }
     // some delayed operations may be unblocked after HW changed
     if (leaderHWIncremented)
+      //检查delayedProducePurgatory、delayedFetchPurgatory 方法是否满足完成
       tryCompleteDelayedRequests()
     isNewLeader
   }
@@ -681,6 +688,7 @@ class Partition(val topicPartition: TopicPartition,
       needsExpandIsr(followerReplica)
     }
     if (needsIsrUpdate) {
+      //加锁
       inWriteLock(leaderIsrUpdateLock) {
         // check if this replica needs to be added to the ISR
         if (needsExpandIsr(followerReplica)) {
