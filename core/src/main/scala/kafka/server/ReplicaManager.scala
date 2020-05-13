@@ -157,8 +157,8 @@ class ReplicaManager(val config: KafkaConfig,
                      metrics: Metrics,
                      time: Time,
                      val zkClient: KafkaZkClient,
-                     scheduler: Scheduler,
-                     val logManager: LogManager,
+                     scheduler: Scheduler,//定时器，用于执行定时任务
+                     val logManager: LogManager,// logManager 对象，对分区的读写操作都委托给底层的日志存储子系统
                      val isShuttingDown: AtomicBoolean,
                      quotaManagers: QuotaManagers,
                      val brokerTopicStats: BrokerTopicStats,
@@ -199,21 +199,31 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   /* epoch of the controller that last changed the leader */
+  // 记录kafka controller 的年代信息， 当重新选举controller leader 时该字段值会递增。之后在，replicaManager 处理来自kafka controller 的请求时。
+  // 会先检测请求中携带的年代信息是否等于 controllerEpoch 字段的值， 这就避免接收旧 controller leader 发送的请求。
   @volatile var controllerEpoch: Int = KafkaController.InitialControllerEpoch
+  // 当前broker 的 id， 主要用于查找 local replica
   private val localBrokerId = config.brokerId
+  // 保存了当前 broker 上分配的所有partition 信息，这里需要注意 pool 的 valueFactory，当从pool 查找不到指定key 时，
+  // 则使用valueFactory 创建一个默认value 值放入 pool 并返回。
   private val allPartitions = new Pool[TopicPartition, HostedPartition](
     valueFactory = Some(tp => HostedPartition.Online(Partition(tp, time, this)))
   )
   private val replicaStateChangeLock = new Object
+  // 在replicaFetcherManager 中管理了多个 replicaFetcherThread 线程，replicaFetherThread 线程会向Leader 副本发送FetchRequest 请求来获取消息。
+  // 实现Follower 副本与leader 副本同步。replicaFetcherManager 对象在 ReplicaManager 初始化时被创建。
   val replicaFetcherManager = createReplicaFetcherManager(metrics, time, threadNamePrefix, quotaManagers.follower)
   val replicaAlterLogDirsManager = createReplicaAlterLogDirsManager(quotaManagers.alterLogDirs, brokerTopicStats)
   private val highWatermarkCheckPointThreadStarted = new AtomicBoolean(false)
+  // 用于缓存每个log 目录与 OffsetCheckpoint之间的对应关系。offsetCheckpoint 记录了对应log目录下的 下 replication-offset-checkpoint 文件
+  // 该文件中记录了data 目录下每个 partition 的hw， ReplicaManager 中的 highwatermark-checkpoint 任务会定时更新 replication-offset-checkpoint 文件
   @volatile var highWatermarkCheckpoints: Map[String, OffsetCheckpointFile] = logManager.liveLogDirs.map(dir =>
     (dir.getAbsolutePath, new OffsetCheckpointFile(new File(dir, ReplicaManager.HighWatermarkFilename), logDirFailureChannel))).toMap
 
   this.logIdent = s"[ReplicaManager broker=$localBrokerId] "
   private val stateChangeLogger = new StateChangeLogger(localBrokerId, inControllerContext = false, None)
 
+  //用于记录 isr 集合发生变化的分区信息
   private val isrChangeSet: mutable.Set[TopicPartition] = new mutable.HashSet[TopicPartition]()
   private val lastIsrChangeMs = new AtomicLong(System.currentTimeMillis())
   private val lastIsrPropagationMs = new AtomicLong(System.currentTimeMillis())
@@ -762,7 +772,7 @@ class ReplicaManager(val config: KafkaConfig,
    */
   private def appendToLocalLog(internalTopicsAllowed: Boolean,
                                origin: AppendOrigin,
-                               entriesPerPartition: Map[TopicPartition, MemoryRecords],
+                               entriesPerPartition: Map[TopicPartition, MemoryRecords],//每个分区需要追加的日志
                                requiredAcks: Short): Map[TopicPartition, LogAppendResult] = {
 
     def processFailedRecord(topicPartition: TopicPartition, t: Throwable) = {
@@ -778,12 +788,14 @@ class ReplicaManager(val config: KafkaConfig,
     }
 
     trace(s"Append [$entriesPerPartition] to local log")
+    //对消息进行迭代,每迭代一次得到一个分区以及对应的消息集合
     entriesPerPartition.map { case (topicPartition, records) =>
       brokerTopicStats.topicStats(topicPartition.topic).totalProduceRequestRate.mark()
       brokerTopicStats.allTopicsStats.totalProduceRequestRate.mark()
 
       // reject appending to internal topics if it is not allowed
-      //是否是内部topic
+      // 是否是内部topic，内部 topic 为 __consumer_offsets ， __transaction_state，
+      // 如果是内部topic 就根据 internalTopicsAllowed 来判断是否可以向内部 topic 写入消息
       if (Topic.isInternal(topicPartition.topic) && !internalTopicsAllowed) {
         (topicPartition, LogAppendResult(
           LogAppendInfo.UnknownLogAppendInfo,
@@ -1580,6 +1592,7 @@ class ReplicaManager(val config: KafkaConfig,
    */
   private def updateFollowerFetchState(followerId: Int,
                                        readResults: Seq[(TopicPartition, LogReadResult)]): Seq[(TopicPartition, LogReadResult)] = {
+    //遍历
     readResults.map { case (topicPartition, readResult) =>
       val updatedReadResult = if (readResult.error != Errors.NONE) {
         debug(s"Skipping update of fetch state for follower $followerId since the " +
@@ -1588,6 +1601,7 @@ class ReplicaManager(val config: KafkaConfig,
       } else {
         nonOfflinePartition(topicPartition) match {
           case Some(partition) =>
+            // 调用partition.updateReplicaLogReadResult 方法，其中会更新 follower 副本的状态调用 maybeExpandIsr 方法尝试扩张isr集合
             if (partition.updateFollowerFetchState(followerId,
               followerFetchOffsetMetadata = readResult.info.fetchOffsetMetadata,
               followerStartOffset = readResult.followerLogStartOffset,
