@@ -275,6 +275,7 @@ abstract class AbstractFetcherThread(name: String,
     }
   }
 
+  //用于发送 fetchRequest 以及处理 FetchResponse 的
   private def processFetchRequest(sessionPartitions: util.Map[TopicPartition, FetchRequest.PartitionData],
                                   fetchRequest: FetchRequest.Builder): Unit = {
     val partitionsWithError = mutable.Set[TopicPartition]()
@@ -282,6 +283,7 @@ abstract class AbstractFetcherThread(name: String,
 
     try {
       trace(s"Sending fetch request $fetchRequest")
+      //① 向leader 发送 fetch 请求
       responseData = fetchFromLeader(fetchRequest)
     } catch {
       case t: Throwable =>
@@ -298,20 +300,24 @@ abstract class AbstractFetcherThread(name: String,
     }
     fetcherStats.requestRate.mark()
 
+    //② 开始处理 FetchResponse
     if (responseData.nonEmpty) {
       // process fetched data
       inLock(partitionMapLock) {
+        //遍历每个 topicPartition 对应的响应信息
         responseData.foreach { case (topicPartition, partitionData) =>
           Option(partitionStates.stateValue(topicPartition)).foreach { currentFetchState =>
             // It's possible that a partition is removed and re-added or truncated when there is a pending fetch request.
             // In this case, we only want to process the fetch response if the partition state is ready for fetch and
             // the current offset is the same as the offset requested.
             val fetchPartitionData = sessionPartitions.get(topicPartition)
+            //从发送 fetchRequest 到收到 fetchResponse 这段同步时间内， offset 并未发生变化
             if (fetchPartitionData != null && fetchPartitionData.fetchOffset == currentFetchState.fetchOffset && currentFetchState.isReadyForFetch) {
               partitionData.error match {
                 case Errors.NONE =>
                   try {
                     // Once we hand off the partition data to the subclass, we can't mess with it any more in this thread
+                    // 处理从leader 副本获取的消息集合追加到 log 中
                     val logAppendInfoOpt = processPartitionData(topicPartition, currentFetchState.fetchOffset,
                       partitionData)
 
@@ -349,6 +355,14 @@ abstract class AbstractFetcherThread(name: String,
                         s"at offset ${currentFetchState.fetchOffset}", t)
                       markPartitionFailed(topicPartition)
                   }
+                  /*
+                    处理 follower副本请求的offset 超出了 leader 副本的 offset 范围，可能是超过leader 的 LEO，
+                    也可能是小于 leader 的最小offset(startOffset),当发生"Unclean leader election" 时，可能出现第一种情况，
+                    这种场景简单来说将不在 ISR 集合中的 follower 副本被选举成为 leader 副本，发生此场景的过程如下：
+                    1.一个follower 副本发生宕机，而leader 副本不断接收来自生产者的消息并追加到log中，此时follower 副本因为宕机没有和leader副本进行同步
+                    2.此follower 副本重新上线，在它与leader 完全同步之前，它没有资格进入 ISR 集合，假设isr集合中的follower 副本在此时全部宕机，只能选举此 follower 副本为新leader 副本
+                    3.之后，旧leader 重新上线成为 follower 副本，此时就会出现 follower 副本的 LEO 超越了 leader 副本的 LEO 值的场景。
+                   */
                 case Errors.OFFSET_OUT_OF_RANGE =>
                   if (!handleOutOfRangeError(topicPartition, currentFetchState))
                     partitionsWithError += topicPartition

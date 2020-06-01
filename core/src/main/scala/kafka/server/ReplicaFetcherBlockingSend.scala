@@ -100,6 +100,7 @@ class ReplicaFetcherBlockingSend(sourceBroker: BrokerEndPoint,
 
   override def sendRequest(requestBuilder: Builder[_ <: AbstractRequest]): ClientResponse = {
     try {
+      //堵塞等待 Node 的状态变为 ready， 超时则会抛出异常
       if (!NetworkClientUtils.awaitReady(networkClient, sourceNode, time, socketTimeout))
         throw new SocketTimeoutException(s"Failed to connect within $socketTimeout ms")
       else {

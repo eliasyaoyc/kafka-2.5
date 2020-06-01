@@ -157,13 +157,21 @@ class ReplicaManager(val config: KafkaConfig,
                      metrics: Metrics,
                      time: Time,
                      val zkClient: KafkaZkClient,
+                     /*
+                       定时器，四个定时任务:
+                        1.shutdown-idle-replica-alter-log-dirs-thread
+                        2.highwatermark-checkpoint
+                        3.isr-expiration
+                        4.isr-change-propagation
+                      */
                      scheduler: Scheduler,
-                     val logManager: LogManager,
+                     val logManager: LogManager,// 对分区的读写操作都委托给底层的日志存储子系统
                      val isShuttingDown: AtomicBoolean,
                      quotaManagers: QuotaManagers,
-                     val brokerTopicStats: BrokerTopicStats,
-                     val metadataCache: MetadataCache,
+                     val brokerTopicStats: BrokerTopicStats,//broker 状态
+                     val metadataCache: MetadataCache,//元数据缓存
                      logDirFailureChannel: LogDirFailureChannel,
+                     // 延迟操作
                      val delayedProducePurgatory: DelayedOperationPurgatory[DelayedProduce],
                      val delayedFetchPurgatory: DelayedOperationPurgatory[DelayedFetch],
                      val delayedDeleteRecordsPurgatory: DelayedOperationPurgatory[DelayedDeleteRecords],
@@ -199,15 +207,23 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   /* epoch of the controller that last changed the leader */
+  /*
+     controller 的年代信息，当重新选举 controller leader 的时候该字段会递增，ReplicaManager 处理来自 KafkaController 的请求时，
+     会先检测请求中携带的年代信息是否等于controllerEpoch 字段的值，避免脑裂
+   */
   @volatile var controllerEpoch: Int = KafkaController.InitialControllerEpoch
+  //当前broker id，主要用于查找 local replica
   private val localBrokerId = config.brokerId
+  //当前broker 上分配的所有的partition
   private val allPartitions = new Pool[TopicPartition, HostedPartition](
     valueFactory = Some(tp => HostedPartition.Online(Partition(tp, time, this)))
   )
   private val replicaStateChangeLock = new Object
+  //管理多个ReplicaFetcherThread 线程， 用于向leader 副本发送 fetchRequest 请求来获取消息实现 follower 与 leader 副本同步。
   val replicaFetcherManager = createReplicaFetcherManager(metrics, time, threadNamePrefix, quotaManagers.follower)
   val replicaAlterLogDirsManager = createReplicaAlterLogDirsManager(quotaManagers.alterLogDirs, brokerTopicStats)
   private val highWatermarkCheckPointThreadStarted = new AtomicBoolean(false)
+  //用于缓存每个log 目录与 offsetCheckpoint 之间的对应关系，offsetCheckpoint 记录了 对应log目录下的 replication-offset-checkpoint 文件，该文件用于记录了 data目录下每个partition的hw
   @volatile var highWatermarkCheckpoints: Map[String, OffsetCheckpointFile] = logManager.liveLogDirs.map(dir =>
     (dir.getAbsolutePath, new OffsetCheckpointFile(new File(dir, ReplicaManager.HighWatermarkFilename), logDirFailureChannel))).toMap
 
@@ -326,6 +342,7 @@ class ReplicaManager(val config: KafkaConfig,
   def stopReplica(topicPartition: TopicPartition, deletePartition: Boolean)  = {
     stateChangeLogger.trace(s"Handling stop replica (delete=$deletePartition) for partition $topicPartition")
 
+    //③ 根据 deletePartition 的值 决定是否对log进行删除
     if (deletePartition) {
       getPartition(topicPartition) match {
         case HostedPartition.Offline =>
@@ -335,7 +352,7 @@ class ReplicaManager(val config: KafkaConfig,
           if (allPartitions.remove(topicPartition, hostedPartition)) {
             maybeRemoveTopicMetrics(topicPartition.topic)
             // this will delete the local log. This call may throw exception if the log is on offline directory
-            removedPartition.delete()
+            removedPartition.delete() // 删除副本，log会被删除
           }
 
         case HostedPartition.None =>
@@ -367,6 +384,7 @@ class ReplicaManager(val config: KafkaConfig,
   def stopReplicas(stopReplicaRequest: StopReplicaRequest): (mutable.Map[TopicPartition, Errors], Errors) = {
     replicaStateChangeLock synchronized {
       val responseMap = new collection.mutable.HashMap[TopicPartition, Errors]
+      //① 检查请求中的 controllerEpoch 值
       if (stopReplicaRequest.controllerEpoch() < controllerEpoch) {
         stateChangeLogger.warn("Received stop replica request from an old controller epoch " +
           s"${stopReplicaRequest.controllerEpoch}. Latest known controller epoch is $controllerEpoch")
@@ -379,6 +397,7 @@ class ReplicaManager(val config: KafkaConfig,
         replicaAlterLogDirsManager.removeFetcherForPartitions(partitions)
         for (topicPartition <- partitions){
           try {
+            // ② 停止指定分区的同步操作
             stopReplica(topicPartition, stopReplicaRequest.deletePartitions)
             responseMap.put(topicPartition, Errors.NONE)
           } catch {
@@ -1215,7 +1234,7 @@ class ReplicaManager(val config: KafkaConfig,
 
         leaderAndIsrRequest.partitionStates.asScala.foreach { partitionState =>
           val topicPartition = new TopicPartition(partitionState.topicName, partitionState.partitionIndex)
-          //获取partition对象。
+          //获取partition对象,找不到就创建新的 partition 对象
           val partitionOpt = getPartition(topicPartition) match {
             case HostedPartition.Offline =>
               stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from " +
@@ -1237,9 +1256,11 @@ class ReplicaManager(val config: KafkaConfig,
           partitionOpt.foreach { partition =>
             val currentLeaderEpoch = partition.getLeaderEpoch
             val requestLeaderEpoch = partitionState.leaderEpoch
+            //检查 leaderEpoch
             if (requestLeaderEpoch > currentLeaderEpoch) {
               // If the leader epoch is valid record the epoch of the controller that made the leadership decision.
               // This is useful while updating the isr to maintain the decision maker controller's epoch in the zookeeper path
+              //判断该分区的副本是否被分配到了当前的 broker
               if (partitionState.replicas.contains(localBrokerId))
                 partitionStates.put(partition, partitionState)
               else {
@@ -1336,8 +1357,10 @@ class ReplicaManager(val config: KafkaConfig,
         }
         replicaAlterLogDirsManager.addFetcherForPartitions(futureReplicasAndInitialOffset)
 
+        //关闭ReplicaFetcherManagerIdle 中空闲的 fetcher 线程
         replicaFetcherManager.shutdownIdleFetcherThreads()
         replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
+        //回调函数
         onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
         val responsePartitions = responseMap.iterator.map { case (tp, error) =>
           new LeaderAndIsrPartitionError()
@@ -1388,6 +1411,7 @@ class ReplicaManager(val config: KafkaConfig,
       // Update the partition information to be the leader
       partitionStates.foreach { case (partition, partitionState) =>
         try {
+          //① 调用 partition.makeLeader 方法使得当前 replica 成为 leader
           if (partition.makeLeader(controllerId, partitionState, correlationId, highWatermarkCheckpoints)) {
             partitionsToMakeLeaders += partition
             stateChangeLogger.trace(s"Stopped fetchers as part of become-leader request from " +

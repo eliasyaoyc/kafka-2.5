@@ -214,6 +214,7 @@ class Partition(val topicPartition: TopicPartition,
   @volatile var leaderReplicaIdOpt: Option[Int] = None
   //isr 集合维护了该分区的isr集合，isr 集合是 ar集合的子集
   @volatile var inSyncReplicaIds = Set.empty[Int]
+  //ar 集合
   @volatile var assignmentState: AssignmentState = SimpleAssignmentState(Seq.empty)
 
   // Logs belonging to this partition. Majority of time it will be only one log, but if log directory
@@ -474,6 +475,7 @@ class Partition(val topicPartition: TopicPartition,
    * Make the local replica the leader by resetting LogEndOffset for remote replicas (there could be old LogEndOffset
    * from the time when this broker was the leader last time) and setting the new leader and ISR.
    * If the leader replica id does not change, return false to indicate the replica manager.
+   *
    */
   def makeLeader(controllerId: Int,
                  partitionState: LeaderAndIsrPartitionState,
@@ -682,6 +684,7 @@ class Partition(val topicPartition: TopicPartition,
    * whether a replica is in-sync, we only check HW.
    *
    * This function can be triggered when a replica's LEO has incremented.
+   * 扩大 isr 集合
    */
   private def maybeExpandIsr(followerReplica: Replica, followerFetchTimeMs: Long): Unit = {
     val needsIsrUpdate = inReadLock(leaderIsrUpdateLock) {
@@ -720,6 +723,7 @@ class Partition(val topicPartition: TopicPartition,
    * Note that this method will only be called if requiredAcks = -1 and we are waiting for all replicas in ISR to be
    * fully caught up to the (local) leader's offset corresponding to this produce request before we acknowledge the
    * produce request.
+   * 检查hw的位置
    */
   def checkEnoughReplicasReachOffset(requiredOffset: Long): (Boolean, Errors) = {
     leaderLogIfLocal match {
@@ -841,6 +845,7 @@ class Partition(val topicPartition: TopicPartition,
    */
   private def tryCompleteDelayedRequests(): Unit = delayedOperations.checkAndCompleteAll()
 
+  //缩小 isr 集合
   def maybeShrinkIsr(): Unit = {
     val needsIsrUpdate = inReadLock(leaderIsrUpdateLock) {
       needsShrinkIsr()
@@ -848,8 +853,10 @@ class Partition(val topicPartition: TopicPartition,
     val leaderHWIncremented = needsIsrUpdate && inWriteLock(leaderIsrUpdateLock) {
       leaderLogIfLocal match {
         case Some(leaderLog) =>
+          //通过检测 follower 副本的 lastCaughtUpTimeMsUnderlying 字段，找出已滞后的 follower 副本集合，该滞后集合中的follower 副本会被剔除 isr 集合
           val outOfSyncReplicaIds = getOutOfSyncReplicas(replicaLagTimeMaxMs)
           if (outOfSyncReplicaIds.nonEmpty) {
+            //从 isr 中剔除，生成新的 isr
             val newInSyncReplicaIds = inSyncReplicaIds -- outOfSyncReplicaIds
             assert(newInSyncReplicaIds.nonEmpty)
             info("Shrinking ISR from %s to %s. Leader: (highWatermark: %d, endOffset: %d). Out of sync replicas: %s."
@@ -864,9 +871,11 @@ class Partition(val topicPartition: TopicPartition,
             )
 
             // update ISR in zk and in cache
+            // 更新 zk
             shrinkIsr(newInSyncReplicaIds)
 
             // we may need to increment high watermark since ISR could be down to 1
+            // 更新 leader 的 hw
             maybeIncrementLeaderHW(leaderLog)
           } else {
             false
@@ -878,6 +887,7 @@ class Partition(val topicPartition: TopicPartition,
 
     // some delayed operations may be unblocked after HW changed
     if (leaderHWIncremented)
+      // 尝试执行延迟任务
       tryCompleteDelayedRequests()
   }
 

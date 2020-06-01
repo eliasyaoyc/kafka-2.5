@@ -146,6 +146,7 @@ class ReplicaFetcherThread(name: String,
   }
 
   // process fetched data
+  //会将fetch 方法返回来的消息追加到 follower 副本的 log中，并更新 follower 副本的 hw
   override def processPartitionData(topicPartition: TopicPartition,
                                     fetchOffset: Long,
                                     partitionData: FetchData): Option[LogAppendInfo] = {
@@ -163,7 +164,7 @@ class ReplicaFetcherThread(name: String,
       trace("Follower has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
         .format(log.logEndOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
 
-    // Append the leader's messages to the log
+    // Append the leader's messages to the log  追加日志
     val logAppendInfo = partition.appendRecordsToFollowerOrFutureReplica(records, isFuture = false)
 
     if (isTraceEnabled)
@@ -173,6 +174,7 @@ class ReplicaFetcherThread(name: String,
 
     // For the follower replica, we do not need to keep its segment base offset and physical position.
     // These values will be computed upon becoming leader or handling a preferred read replica fetch.
+    // 更新 follower 副本的 hw
     val followerHighWatermark = log.updateHighWatermark(partitionData.highWatermark)
     log.maybeIncrementLogStartOffset(leaderLogStartOffset)
     if (isTraceEnabled)
