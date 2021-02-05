@@ -108,17 +108,22 @@ abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val
 
   @volatile
   protected var mmap: MappedByteBuffer = {
+    // ① 创建索引文件
     val newlyCreated = file.createNewFile()
+    // ② 以 writable 指定的方式 （读写方式或只读方法） 打开索引文件
     val raf = if (writable) new RandomAccessFile(file, "rw") else new RandomAccessFile(file, "r")
     try {
       /* pre-allocate the file if necessary */
       if(newlyCreated) {
+        // 预设的索引文件大小不能太小，如果连一个索引项都保存不了，直接抛出异常
         if(maxIndexSize < entrySize)
           throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
+        // ③ 设置索引文件长度，roundDownToExactMultiple计算的是不超过maxIndexSize的最大整数倍entrySize 比如maxIndexSize=1234567，entrySize=8，那么调整后的文件长度为1234560
         raf.setLength(roundDownToExactMultiple(maxIndexSize, entrySize))
       }
 
       /* memory-map the file */
+      // ④ 更新索引长度字段_length
       _length = raf.length()
       val idx = {
         if (writable)
@@ -127,13 +132,16 @@ abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val
           raf.getChannel.map(FileChannel.MapMode.READ_ONLY, 0, _length)
       }
       /* set the position in the index for the next entry */
+      // ⑥ 如果是新创建的索引文件，将MappedByteBuffer对象的当前位置置成0 如果索引文件已存在，将MappedByteBuffer对象的当前位置设置成最后一个索引项所在的位置
       if(newlyCreated)
         idx.position(0)
       else
         // if this is a pre-existing index, assume it is valid and set position to last entry
         idx.position(roundDownToExactMultiple(idx.limit(), entrySize))
+      // ⑦ 返回创建的MappedByteBuffer对象
       idx
     } finally {
+      // 关闭打开索引文件句柄
       CoreUtils.swallow(raf.close(), AbstractIndex)
     }
   }
@@ -364,6 +372,8 @@ abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val
 
   /**
    * Lookup lower and upper bounds for the given target.
+   * 重要方法，通过二分查找来获取小于给定 offset 最大的 offset 和对应的 position
+   * 2.5 版本，通过热区和冷区，然后分别在这两个区域执行二分查找
    */
   private def indexSlotRangeFor(idx: ByteBuffer, target: Long, searchEntity: IndexSearchEntity): (Int, Int) = {
     // check if the index is empty

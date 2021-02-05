@@ -55,10 +55,14 @@ import scala.math._
 @nonthreadsafe
 class LogSegment private[log] (val log: FileRecords,//用于操作对应日志文件的FileRecords 对象
                                val lazyOffsetIndex: LazyIndex[OffsetIndex],//index
-                               val lazyTimeIndex: LazyIndex[TimeIndex],
+                               val lazyTimeIndex: LazyIndex[TimeIndex],  // time index
                                val txnIndex: TransactionIndex,//事务index
-                               val baseOffset: Long,// LogSegment 中第一条消息的offset值
-                               val indexIntervalBytes: Int,//索引项之间间隔的的最小字节数
+                               val baseOffset: Long,// LogSegment 中第一条消息的offset值(每个segment的起始位移，一旦创建就不会改变)
+                               val indexIntervalBytes: Int,//索引项之间间隔的的最小字节数，默认4kb，log.index.interval.bytes. 也就是说默认写入4kb数据才会创建一条索引
+                              /*
+                              防止 kafka 大量日志切分造成磁盘io暴增，log.roll.jitter.ms
+                              控制日志段新增计时的『扰动项』，每次新增一个segment的时候就会岔开一段时间，具体查看 shouldRoll 方法
+                               */
                                val rollJitterMs: Long,
                                val time: Time) extends Logging {
 
@@ -153,15 +157,16 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
-      val physicalPosition = log.sizeInBytes()//该条目需要添加的位置
+      // 首先调用 log.sizeInBytes 方法判断该日志段是否为空，如果是空的话， Kafka 需要记录要写入消息集合的最大时间戳，并将其作为后面新增日志段倒计时的依据。
+      val physicalPosition = log.sizeInBytes()
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
 
-      //确保索引在这个分段范围内
+      //它与日志段起始位移的差值是否在整数范围内，即 largestOffset - baseOffset 的值是不是介于 [0，Int.MAXVALUE] 之间
       ensureOffsetInRange(largestOffset)
 
       // append the messages
-      //添加日志
+      // 添加日志，底层是将内存中的消息对象写入操作系统的也页缓存
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
@@ -298,10 +303,12 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
   def read(startOffset: Long,
            maxSize: Int,
            maxPosition: Long = size,
+          // 当读取大容量的消息的时候(超过了maxSize的限制)是否允许至少返回第一条消息
            minOneMessage: Boolean = false): FetchDataInfo = {
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    // ① 定位要读取的起始文件位置（startPosition），参数 startOffset 只是位移值。Kafka 需要根据索引信息找到对应的物理文件位置才能读取消息
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null
@@ -322,6 +329,7 @@ class LogSegment private[log] (val log: FileRecords,//用于操作对应日志�
     // calculate the length of the message set to read based on whether or not they gave us a maxOffset
     val fetchSize: Int = min((maxPosition - startPosition).toInt, adjustedMaxSize)
 
+    // ② 从指定位置读取指定大小的消息集合
     FetchDataInfo(offsetMetadata, log.slice(startPosition, fetchSize),
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }
