@@ -494,6 +494,10 @@ private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQ
 
 /**
  * Thread that accepts and configures new connections. There is one of these per endpoint.
+ *
+ * endPoint：Kafka Broker 连接信息，比如 PLAINTEXT://localhost:9092。Acceptor 需要用到 endPoint 包含的主机名和端口信息创建 Server Socket。
+ * sendBufferSize：它设置的是 SocketOptions 的 SO_SNDBUF，即用于设置出站（Outbound）网络 I/O 的底层缓冲区大小。该值默认是 Broker 端参数 socket.send.buffer.bytes 的值，即 100KB。
+ * recvBufferSize: 它设置的是 SocketOptions 的 SO_RCVBUF，即用于设置入站（Inbound）网络 I/O 的底层缓冲区大小。该值默认是 Broker 端参数 socket.receive.buffer.bytes 的值，即 100KB。
  */
 private[kafka] class Acceptor(val endPoint: EndPoint,
                               val sendBufferSize: Int,
@@ -503,8 +507,11 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
                               metricPrefix: String) extends AbstractServerThread(connectionQuotas) with KafkaMetricsGroup {
 
   //java nio selector
+  // 创建底层的NIO Selector 对象
+  // Selector对象负责执行底层实际I/O操作，如监听连接创建请求、读写请求等
   private val nioSelector = NSelector.open()
-  //接收客户端请求的 ServerSocketChannel
+  // Broker端创建对应的ServerSocketChannel实例
+  // 接收客户端请求 后续把该Channel向上一步的Selector对象注册
   val serverChannel = openServerSocket(endPoint.host, endPoint.port)
   //processors 类型的数组
   private val processors = new ArrayBuffer[Processor]()
@@ -559,12 +566,13 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
     //标识当前线程启动操作已经完成
     startupComplete()
     try {
+      // 当前使用的Processor序号，从0开始，最大值是num.network.threads - 1
       var currentProcessorIndex = 0
       while (isRunning) {//检测线程运行状态
         try {
 
           val ready = nioSelector.select(500) //等待关注的事件
-          if (ready > 0) {
+          if (ready > 0) { // 如果有I/O事件准备就绪
             val keys = nioSelector.selectedKeys()
             val iter = keys.iterator()
             while (iter.hasNext && isRunning) {
@@ -582,6 +590,7 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
                     var processor: Processor = null
                     do {
                       retriesLeft -= 1
+                      // 指定由哪个Processor线程进行处理
                       processor = synchronized {
                         // adjust the index (if necessary) and retrieve the processor atomically for
                         // correct behaviour in case the number of processors is reduced dynamically
@@ -695,7 +704,9 @@ private[kafka] object Processor {
 /**
  * Thread that processes all requests from a single connection. There are N of these running in parallel
  * each of which has its own selector
+ *
  * 用于完成读取请求和写回响应的操作，Processor 不参与具体业务逻辑的处理
+ * 如果说 Acceptor 是做入站连接处理的，那么，Processor 代码则是真正创建连接以及分发请求的地方。
  */
 private[kafka] class Processor(val id: Int,
                                time: Time,
@@ -795,7 +806,7 @@ private[kafka] class Processor(val id: Int,
 
   //和Acceptor 一样继承 AbstractServerThread
   override def run(): Unit = {
-    //标识Processor的初始化流程已经结束，唤醒堵塞等待此Processor初始化完成得闲城
+    //标识Processor的初始化流程已经结束，唤醒堵塞等待此Processor初始化完成得线程
     startupComplete()
     try {
       while (isRunning) {
@@ -873,7 +884,7 @@ private[kafka] class Processor(val id: Int,
             tryUnmuteChannel(channelId)
 
           case response: SendResponse =>
-            sendResponse(response, response.responseSend)
+            sendResponse(response, response.responseSend) // 核心方法
           case response: CloseConnectionResponse =>
             updateRequestMetrics(response)
             trace("Closing socket connection actively according to the response code.")

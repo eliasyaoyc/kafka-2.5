@@ -88,19 +88,19 @@ import scala.util.{Failure, Success, Try}
 /**
  * Logic to handle the various Kafka requests
  */
-class KafkaApis(val requestChannel: RequestChannel,
-                val replicaManager: ReplicaManager,
-                val adminManager: AdminManager,
-                val groupCoordinator: GroupCoordinator,
-                val txnCoordinator: TransactionCoordinator,
-                val controller: KafkaController,
-                val zkClient: KafkaZkClient,
-                val brokerId: Int,
-                val config: KafkaConfig,
-                val metadataCache: MetadataCache,
+class KafkaApis(val requestChannel: RequestChannel, // 请求通道
+                val replicaManager: ReplicaManager, // 副本管理器
+                val adminManager: AdminManager, // 主题、分区、配置等方面的管理器
+                val groupCoordinator: GroupCoordinator, // 消费者组协调器组件
+                val txnCoordinator: TransactionCoordinator, // 事务管理器组件
+                val controller: KafkaController, // 控制器组件
+                val zkClient: KafkaZkClient, // zk 客户端程序，Kafka 依赖于该类实现与 zk 交互
+                val brokerId: Int, // broker.id 参数值
+                val config: KafkaConfig, // kafka 配置类
+                val metadataCache: MetadataCache, // 元数据缓存类，保存和更新集群 broker 间元数据缓存
                 val metrics: Metrics,
                 val authorizer: Option[Authorizer],
-                val quotas: QuotaManagers,
+                val quotas: QuotaManagers, // 配置管理器组件，负责 客户端、副本、等对象的配额管理
                 val fetchManager: FetchManager,
                 brokerTopicStats: BrokerTopicStats,
                 val clusterId: String,

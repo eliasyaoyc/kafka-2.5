@@ -69,11 +69,17 @@ object RequestChannel extends Logging {
     }
   }
 
+  // 定义各类 Clients 端或  Broker 端请求的实现类。
+  /*
+     Processor 线程的序号，即这个请求是由哪个 Processor 线程接受处理的  num.network.threads 控制 processor 线程数
+     默认是 3 也就是 listeners 配置一个 kafka server ip 就会创建3个processor
+     注意 processor 线程仅仅是网络接受线程，不会真正执行 Request 请求处理逻辑那是 io 线程负责的事情
+   */
   class Request(val processor: Int,
-                val context: RequestContext,
-                val startTimeNanos: Long,
-                memoryPool: MemoryPool,
-                @volatile private var buffer: ByteBuffer,
+                val context: RequestContext, // 保存有关 Request 上下文
+                val startTimeNanos: Long, // Request 对象被创建的时间，主要用于各种时间统计指标的计算。
+                memoryPool: MemoryPool, // 非阻塞式的内存缓冲区，主要作用是避免 Request 对象无限使用内存。
+                @volatile private var buffer: ByteBuffer, // buffer 是真正保存 Request 对象内容的字节缓冲区
                 metrics: RequestChannel.Metrics) extends BaseRequest {
     // These need to be volatile because the readers are in the network thread and the writers are in the request
     // handler threads or the purgatory threads
@@ -223,6 +229,9 @@ object RequestChannel extends Logging {
 
   }
 
+  /*
+     每个 Response 对象都包含了对应的 Request 对象。这个类里最重要的方法是 onComplete 方法，用来实现每类 Response 被处理后需要执行的回调逻辑。
+   */
   abstract class Response(val request: Request) {
     locally {
       val nowNs = Time.SYSTEM.nanoseconds
@@ -241,6 +250,7 @@ object RequestChannel extends Logging {
   }
 
   /** responseAsString should only be defined if request logging is enabled */
+  // Kafka 大多数 Request 处理完成后都需要执行一段回调逻辑，SendResponse 就是保存返回结果的 Response 子类，里面最重要的字段就是 omCompleteCallback,即处理完成之后的回调逻辑
   class SendResponse(request: Request,
                      val responseSend: Send,
                      val responseAsString: Option[String],
@@ -253,32 +263,41 @@ object RequestChannel extends Logging {
       s"Response(type=Send, request=$request, send=$responseSend, asString=$responseAsString)"
   }
 
+  // 有些 Request 处理完成后无需单独执行额外的回调逻辑。NoResponse 就是为这类 Response 准备的。
   class NoOpResponse(request: Request) extends Response(request) {
     override def toString: String =
       s"Response(type=NoOp, request=$request)"
   }
 
+  // 用于出错后需要关闭 TCP 连接的场景，此时返回 CloseConnectionResponse 给 Request 发送方，显式地通知它关闭连接。
   class CloseConnectionResponse(request: Request) extends Response(request) {
     override def toString: String =
       s"Response(type=CloseConnection, request=$request)"
   }
 
+  // 用于通知 Broker 的 Socket Server 组件（后面几节课我会讲到它）某个 TCP 连接通信通道开始被限流（throttling）。
   class StartThrottlingResponse(request: Request) extends Response(request) {
     override def toString: String =
       s"Response(type=StartThrottling, request=$request)"
   }
 
+  // 与 StartThrottlingResponse 对应，通知 Broker 的 SocketServer 组件某个 TCP 连接通信通道的限流已结束。
   class EndThrottlingResponse(request: Request) extends Response(request) {
     override def toString: String =
       s"Response(type=EndThrottling, request=$request)"
   }
 }
 
+/*
+  queueSize 就是这个 requestQueue 队列的最大长度  对应 queued.max.requests 参数，默认情况是500
+ */
 class RequestChannel(val queueSize: Int, val metricNamePrefix : String) extends KafkaMetricsGroup {
   import RequestChannel._
   val metrics = new RequestChannel.Metrics
   //processor 线程向handler 线程传递请求的队列，因为多个processor 线程和多个handler线程并发操作，所以选择线程安全的队列。
+  // 用来保存 Broker 接受到的各类请求，这个队列被称为请求队列或Request 队列
   private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
+  // key 是processor的序号，当前 Kafka Broker 端所有网络线程都是在 RequestChannel 中维护的
   private val processors = new ConcurrentHashMap[Int, Processor]()
   val requestQueueSizeMetricName = metricNamePrefix.concat(RequestQueueSizeMetric)
   val responseQueueSizeMetricName = metricNamePrefix.concat(ResponseQueueSizeMetric)
