@@ -64,6 +64,8 @@ abstract class DelayedOperation(override val delayMs: Long,
    * concurrent threads can try to complete the same operation, but only
    * the first thread will succeed in completing the operation and return
    * true, others will still return false
+   *
+   * 强制完成延迟操作，不管它是否满足完成条件。每当操作满足完成条件或已经过期了，就需要调用该方法完成该操作。
    */
   def forceComplete(): Boolean = {
     if (completed.compareAndSet(false, true)) {
@@ -78,17 +80,23 @@ abstract class DelayedOperation(override val delayMs: Long,
 
   /**
    * Check if the delayed operation is already completed
+   *
+   * 检查延迟操作是否已经完成。源码使用这个方法来决定后续如何处理该操作。比如如果操作已经完成了，那么通常需要取消该操作
    */
   def isCompleted: Boolean = completed.get()
 
   /**
    * Call-back to execute when a delayed operation gets expired and hence forced to complete.
+   *
+   * 强制完成之后执行的过期逻辑回调方法。只有真正完成操作的那个线程才有资格调用这个方法。
    */
   def onExpiration(): Unit
 
   /**
    * Process for completing an operation; This function needs to be defined
    * in subclasses and will be called exactly once in forceComplete()
+   *
+   * 完成延迟操作所需的处理逻辑。这个方法只会在 forceComplete 方法中被调用。
    */
   def onComplete(): Unit
 
@@ -98,6 +106,8 @@ abstract class DelayedOperation(override val delayMs: Long,
    * forceComplete() and return true iff forceComplete returns true; otherwise return false
    *
    * This function needs to be defined in subclasses
+   *
+   * 尝试完成延迟操作的顶层方法，内部会调用 forceComplete 方法。
    */
   def tryComplete(): Boolean
 
@@ -112,12 +122,14 @@ abstract class DelayedOperation(override val delayMs: Long,
    * of threadA or threadB will attempt completion of the operation if this flag is set. This ensures that
    * every invocation of `maybeTryComplete` is followed by at least one invocation of `tryComplete` until
    * the operation is actually completed.
+   *
+   * 线程安全版本的 tryComplete 方法。这个方法其实是社区后来才加入的，不过已经慢慢地取代了 tryComplete，现在外部代码调用的都是这个方法了。
    */
   private[server] def maybeTryComplete(): Boolean = {
-    var retry = false
-    var done = false
+    var retry = false // 是否需要重试
+    var done = false  // 延迟操作是否已完成
     do {
-      if (lock.tryLock()) {
+      if (lock.tryLock()) { // 尝试获取锁对象
         try {
           tryCompletePending.set(false)
           done = tryComplete()
@@ -126,12 +138,16 @@ abstract class DelayedOperation(override val delayMs: Long,
         }
         // While we were holding the lock, another thread may have invoked `maybeTryComplete` and set
         // `tryCompletePending`. In this case we should retry.
+        // 运行到这里的线程持有锁，其他线程只能运行 else 分支的代码
+        // 如果其他线程将 maybeTryComplete 设置为 true，那么retry=true 这就相当与其他线程给了本地线程重试的机会
         retry = tryCompletePending.get()
       } else {
         // Another thread is holding the lock. If `tryCompletePending` is already set and this thread failed to
         // acquire the lock, then the thread that is holding the lock is guaranteed to see the flag and retry.
         // Otherwise, we should set the flag and retry on this thread since the thread holding the lock may have
         // released the lock and returned by the time the flag is set.
+        // 运行到这里的线程没有拿到锁
+        // 设置tryCompletePending=true给持有锁的线程一个重试的机会
         retry = !tryCompletePending.getAndSet(true)
       }
     } while (!isCompleted && retry)
@@ -140,6 +156,7 @@ abstract class DelayedOperation(override val delayMs: Long,
 
   /*
    * run() method defines a task that is executed on timeout
+   * 调用延迟操作超时后的过期逻辑，也就是组合调用 forceComplete + onExpiration。
    */
   override def run(): Unit = {
     if (forceComplete())
@@ -174,7 +191,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
         extends Logging with KafkaMetricsGroup {
   /* a list of operation watching keys */
   private class WatcherList {
-    //管理 Watchers 的pool 对象
+    // 定义一组按照Key分组的Watchers对象
     val watchersByKey = new Pool[Any, Watchers](Some((key: Any) => new Watchers(key)))
 
     val watchersLock = new ReentrantLock()
@@ -221,6 +238,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
    * @param operation the delayed operation to be checked
    * @param watchKeys keys for bookkeeping the operation
    * @return true iff the delayed operations can be completed by the caller
+   *
    * 检查DelayedOperation 是否已经完成，若未完成则添加到 watchersByKey 以及 SystemTimer 中。
    */
   def tryCompleteElseWatch(operation: T, watchKeys: Seq[Any]): Boolean = {
@@ -240,20 +258,24 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
     // Hence it is safe to tryComplete() without a lock
     //尝试完成延迟操作
     var isCompletedByMe = operation.tryComplete()
-    if (isCompletedByMe)//已完成，返回
+    // 如果该延迟请求是由本线程完成的，直接返回true即可
+    if (isCompletedByMe)
       return true
 
     var watchCreated = false
     //传入的key 可能是多个，循环把未完成的添加到 watchersByKey
     for(key <- watchKeys) {
       // If the operation is already completed, stop adding it to the rest of the watcher list.
+      // 再次查看请求的完成状态，如果已经完成，就说明是被其他线程完成的，返回false
       if (operation.isCompleted)
         return false
+      // 否则，将该operation加入到Key所在的WatcherList
       watchForOperation(key, operation)
 
+      // 设置watchCreated标记，表明该任务已经被加入到WatcherList
       if (!watchCreated) {
         watchCreated = true
-        //自增
+        // 更新Purgatory中总请求数
         estimatedTotalOperations.incrementAndGet()
       }
     }
