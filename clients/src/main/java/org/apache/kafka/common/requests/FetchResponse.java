@@ -269,12 +269,15 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
     }
 
     public static final class PartitionData<T extends BaseRecords> {
-        public final Errors error;
-        public final long highWatermark;
-        public final long lastStableOffset;
-        public final long logStartOffset;
+        public final Errors error; // 错误码
+        public final long highWatermark; // hw
+        public final long lastStableOffset; // 最新的 lso 值
+        public final long logStartOffset; // 最新的 Log Start Offset 的值
+        // 期望的 Read Replica Kafka 2.4 之后支持部分 Follower 副本可以对外提供读服务
         public final Optional<Integer> preferredReadReplica;
+        // 该分区对应的已中止事务列表
         public final List<AbortedTransaction> abortedTransactions;
+        // 消息集合
         public final T records;
 
         public PartitionData(Errors error,

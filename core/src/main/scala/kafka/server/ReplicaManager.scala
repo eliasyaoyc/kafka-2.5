@@ -153,10 +153,10 @@ object ReplicaManager {
   val IsrChangePropagationInterval = 60000L
 }
 
-class ReplicaManager(val config: KafkaConfig,
-                     metrics: Metrics,
-                     time: Time,
-                     val zkClient: KafkaZkClient,
+class ReplicaManager(val config: KafkaConfig, // 配置管理类
+                     metrics: Metrics,  // 监控指标类
+                     time: Time, // 定时器类
+                     val zkClient: KafkaZkClient,  // ZooKeeper客户端
                      /*
                        定时器，四个定时任务:
                         1.shutdown-idle-replica-alter-log-dirs-thread
@@ -166,10 +166,10 @@ class ReplicaManager(val config: KafkaConfig,
                       */
                      scheduler: Scheduler,
                      val logManager: LogManager,// 对分区的读写操作都委托给底层的日志存储子系统
-                     val isShuttingDown: AtomicBoolean,
-                     quotaManagers: QuotaManagers,
-                     val brokerTopicStats: BrokerTopicStats,//broker 状态
-                     val metadataCache: MetadataCache,//元数据缓存
+                     val isShuttingDown: AtomicBoolean, // 是否已经关闭
+                     quotaManagers: QuotaManagers,  // 配额管理器
+                     val brokerTopicStats: BrokerTopicStats,// Broker主题监控指标类
+                     val metadataCache: MetadataCache,// Broker元数据缓存
                      logDirFailureChannel: LogDirFailureChannel,
                      // 延迟操作
                      val delayedProducePurgatory: DelayedOperationPurgatory[DelayedProduce],
@@ -506,18 +506,25 @@ class ReplicaManager(val config: KafkaConfig,
    * Append messages to leader replicas of the partition, and wait for them to be replicated to other replicas;
    * the callback function will be triggered either when timeout or the required acks are satisfied;
    * if the callback function itself is already synchronized on some object then pass this object to avoid deadlock.
+   *
+   * 需要副本写入的场景有 4 个：
+   * 1. 生产者向 Leader 副本写入消息
+   * 2. Follower 副本拉取消息后写入副本
+   * 3. 消费者组写入组信息
+   * 4. 事务管理器写入事务消息（事务标记、事务元数据）
    */
-  def appendRecords(timeout: Long,
-                    requiredAcks: Short,
-                    internalTopicsAllowed: Boolean,
-                    origin: AppendOrigin,
-                    entriesPerPartition: Map[TopicPartition, MemoryRecords],//需要添加的条目，key是key-partition，value 是memoryRecords
-                    responseCallback: Map[TopicPartition, PartitionResponse] => Unit,
+  def appendRecords(timeout: Long, // 请求处理超时时间
+                    requiredAcks: Short, // 请求acks设置
+                    internalTopicsAllowed: Boolean, // 是否允许写入内部主题
+                    origin: AppendOrigin, // 写入方来源
+                    entriesPerPartition: Map[TopicPartition, MemoryRecords],// 需要添加的条目，key是key-partition，value 是memoryRecords
+                    responseCallback: Map[TopicPartition, PartitionResponse] => Unit, // 回调逻辑
                     delayedProduceLock: Option[Lock] = None,
                     recordConversionStatsCallback: Map[TopicPartition, RecordConversionStats] => Unit = _ => ()): Unit = {
+    // requiredAcks合法取值是-1，0，1，否则视为非法
     if (isValidRequiredAcks(requiredAcks)) {
       val sTime = time.milliseconds
-      //重点方法：添加到本地log中
+      //重点方法：添加到本地log中  调用appendToLocalLog方法写入消息集合到本地日志
       val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
         origin, entriesPerPartition, requiredAcks)
       debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
@@ -525,18 +532,20 @@ class ReplicaManager(val config: KafkaConfig,
       val produceStatus = localProduceResults.map { case (topicPartition, result) =>
         topicPartition ->
                 ProducePartitionStatus(
-                  result.info.lastOffset + 1, // required offset
+                  result.info.lastOffset + 1, // required offset  设置下一条待写入消息的位移值
+                  // 构建PartitionResponse封装写入结果
                   new PartitionResponse(result.error, result.info.firstOffset.getOrElse(-1), result.info.logAppendTime,
                     result.info.logStartOffset, result.info.recordErrors.asJava, result.info.errorMessage)) // response status
       }
 
+      // 尝试更新消息格式转换的指标数据
       recordConversionStatsCallback(localProduceResults.map { case (k, v) => k -> v.info.recordConversionStats })
 
       //ack 设置的如果是 -1 0 那么放入延迟队列。
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
         // create delayed produce operation
         val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
-        //封装成 delayProduce
+        // 封装成 delayProduce
         val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
 
         // create a list of (topic, partition) pairs to use as keys for this delayed produce operation
@@ -545,20 +554,24 @@ class ReplicaManager(val config: KafkaConfig,
         // try to complete the request immediately, otherwise put it into the purgatory
         // this is because while the delayed produce operation is being created, new
         // requests may arrive and hence make this operation completable.
+        // 再一次尝试完成该延时请求
+        // 如果暂时无法完成，则将对象放入到相应的Purgatory中等待后续处理
         delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
 
-      } else {
+      } else { // 无需等待其他副本写入完成，可以立即发送Response
         // we can respond immediately
         val produceResponseStatus = produceStatus.map { case (k, status) => k -> status.responseStatus }
+        // 调用回调逻辑然后返回即可
         responseCallback(produceResponseStatus)
       }
-    } else {
+    } else { // 如果requiredAcks值不合法
       // If required.acks is outside accepted range, something is wrong with the client
       // Just return an error and don't handle the request at all
       val responseStatus = entriesPerPartition.map { case (topicPartition, _) =>
         topicPartition -> new PartitionResponse(Errors.INVALID_REQUIRED_ACKS,
           LogAppendInfo.UnknownLogAppendInfo.firstOffset.getOrElse(-1), RecordBatch.NO_TIMESTAMP, LogAppendInfo.UnknownLogAppendInfo.logStartOffset)
       }
+      // 构造INVALID_REQUIRED_ACKS异常并封装进回调函数调用中
       responseCallback(responseStatus)
     }
   }
@@ -802,7 +815,7 @@ class ReplicaManager(val config: KafkaConfig,
       brokerTopicStats.allTopicsStats.totalProduceRequestRate.mark()
 
       // reject appending to internal topics if it is not allowed
-      //是否是内部topic
+      // 是否是内部topic
       if (Topic.isInternal(topicPartition.topic) && !internalTopicsAllowed) {
         (topicPartition, LogAppendResult(
           LogAppendInfo.UnknownLogAppendInfo,
@@ -880,10 +893,14 @@ class ReplicaManager(val config: KafkaConfig,
                     responseCallback: Seq[(TopicPartition, FetchPartitionData)] => Unit,
                     isolationLevel: IsolationLevel,
                     clientMetadata: Option[ClientMetadata]): Unit = {
-    //检查是否是follower 来发的fetch 请求，用于进行通不
+    //检查是否是follower 来发的fetch 请求，用于进行同步
     val isFromFollower = Request.isValidBrokerId(replicaId)
     //consumer 用来进行消费
     val isFromConsumer = !(isFromFollower || replicaId == Request.FutureLocalReplicaId)
+    // 根据请求发送方判断可读取范围
+    // 如果请求来自于普通消费者，那么可以读到高水位值
+    // 如果请求来自于配置了READ_COMMITTED的消费者，那么可以读到Log Stable Offset值
+    // 如果请求来自于Follower副本，那么可以读到LEO值
     val fetchIsolation = if (!isFromConsumer)
       FetchLogEnd
     else if (isolationLevel == IsolationLevel.READ_COMMITTED)
@@ -924,6 +941,7 @@ class ReplicaManager(val config: KafkaConfig,
     var errorReadingData = false
     val logReadResultMap = new mutable.HashMap[TopicPartition, LogReadResult]
     var anyPartitionsNeedHwUpdate = false
+    // 统计总共可读取的字节数
     logReadResults.foreach { case (topicPartition, logReadResult) =>
       if (logReadResult.error != Errors.NONE)
         errorReadingData = true
@@ -939,6 +957,7 @@ class ReplicaManager(val config: KafkaConfig,
     //                        3) has enough data to respond
     //                        4) some error happens while reading data
     //                        5) any of the requested partitions need HW update
+
     /*
        判断是否能够立即返回FetchResponse
        1) FetchRequest 的 timeout <= 0 ，即消费者或者 follower 副本不希望等待
@@ -1204,6 +1223,7 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  // 具体处理 LeaderAndIsrRequest 请求的地方，同时也是副本管理器添加分区的地方。
   def becomeLeaderOrFollower(correlationId: Int,
                              leaderAndIsrRequest: LeaderAndIsrRequest,
                              onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit): LeaderAndIsrResponse = {
@@ -1215,16 +1235,19 @@ class ReplicaManager(val config: KafkaConfig,
       }
     }
     replicaStateChangeLock synchronized {//加锁
-      //检查 controller  epoch
+      // 如果LeaderAndIsrRequest携带的Controller Epoch
+      // 小于当前Controller的Epoch值
       if (leaderAndIsrRequest.controllerEpoch < controllerEpoch) {
         stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from controller ${leaderAndIsrRequest.controllerId} with " +
           s"correlation id $correlationId since its controller epoch ${leaderAndIsrRequest.controllerEpoch} is old. " +
           s"Latest known controller epoch is $controllerEpoch")
+        // 说明Controller已经易主，抛出相应异常
         leaderAndIsrRequest.getErrorResponse(0, Errors.STALE_CONTROLLER_EPOCH.exception)
       } else {
         //统计返回的错误码
         val responseMap = new mutable.HashMap[TopicPartition, Errors]
         val controllerId = leaderAndIsrRequest.controllerId
+        // 更新当前Controller Epoch值
         controllerEpoch = leaderAndIsrRequest.controllerEpoch
 
         // First check partition's leader epoch
@@ -1236,16 +1259,22 @@ class ReplicaManager(val config: KafkaConfig,
           val topicPartition = new TopicPartition(partitionState.topicName, partitionState.partitionIndex)
           //获取partition对象,找不到就创建新的 partition 对象
           val partitionOpt = getPartition(topicPartition) match {
+            // 如果是Offline状态
             case HostedPartition.Offline =>
               stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from " +
                 s"controller $controllerId with correlation id $correlationId " +
                 s"epoch $controllerEpoch for partition $topicPartition as the local replica for the " +
                 "partition is in an offline log directory")
+              // 添加对象异常到Response，并设置分区对象变量partitionOpt=None
               responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
               None
 
+            // 如果是Online状态，直接赋值partitionOpt即可
             case HostedPartition.Online(partition) => Some(partition)
 
+            // 如果是None状态，则表示没有找到分区对象
+            // 那么创建新的分区对象将，新创建的分区对象加入到allPartitions统一管理
+            // 然后赋值partitionOpt字段
             case HostedPartition.None =>
               val partition = Partition(topicPartition, time, this)
               allPartitions.putIfNotExists(topicPartition, HostedPartition.Online(partition))
@@ -1253,6 +1282,12 @@ class ReplicaManager(val config: KafkaConfig,
               Some(partition)
           }
 
+          /*
+          首先，比较 LeaderAndIsrRequest 携带的 Controller Epoch 值和当前 Controller Epoch 值。
+          如果发现前者小于后者，说明 Controller 已经变更到别的 Broker 上了，需要构造一个 STALE_CONTROLLER_EPOCH 异常并封装进 Response 返回。
+          否则，代码进入 else 分支。然后，becomeLeaderOrFollower 方法会更新当前缓存的 Controller Epoch 值，再提取出 LeaderAndIsrRequest 请求中涉及到的分区，
+          之后依次遍历这些分区，并执行下面的两步逻辑。
+           */
           partitionOpt.foreach { partition =>
             val currentLeaderEpoch = partition.getLeaderEpoch
             val requestLeaderEpoch = partitionState.leaderEpoch
@@ -1286,15 +1321,18 @@ class ReplicaManager(val config: KafkaConfig,
           }
         }
 
-        // 根据 partitionState 中指定的角色进行分类
+        // 根据 partitionState 中指定的角色进行分类 确定Broker上副本是哪些分区的Leader副本
         val partitionsTobeLeader = partitionStates.filter { case (_, partitionState) =>
           partitionState.leader == localBrokerId
         }
+        // 确定Broker上副本是哪些分区的Follower副本
         val partitionsToBeFollower = partitionStates -- partitionsTobeLeader.keys
 
         val highWatermarkCheckpoints = new LazyOffsetCheckpoints(this.highWatermarkCheckpoints)
         //将指定分区的副本切换成leader 副本
         val partitionsBecomeLeader = if (partitionsTobeLeader.nonEmpty)
+        // 调用makeLeaders方法为partitionsToBeLeader所有分区
+        // 执行"成为Leader副本"的逻辑
           makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader, correlationId, responseMap,
             highWatermarkCheckpoints)
         else
@@ -1314,9 +1352,13 @@ class ReplicaManager(val config: KafkaConfig,
          */
         val leaderTopicSet = leaderPartitionsIterator.map(_.topic).toSet
         val followerTopicSet = partitionsBecomeFollower.map(_.topic).toSet
+        // 对于当前Broker成为Follower副本的主题
+        // 移除它们之前的Leader副本监控指标
         followerTopicSet.diff(leaderTopicSet).foreach(brokerTopicStats.removeOldLeaderMetrics)
 
         // remove metrics for brokers which are not followers of a topic
+        // 对于当前Broker成为Leader副本的主题
+        // 移除它们之前的Follower副本监控指
         leaderTopicSet.diff(followerTopicSet).foreach(brokerTopicStats.removeOldFollowerMetrics)
 
         leaderAndIsrRequest.partitionStates.asScala.foreach { partitionState =>
@@ -1333,6 +1375,9 @@ class ReplicaManager(val config: KafkaConfig,
 
         // we initialize highwatermark thread after the first leaderisrrequest. This ensures that all the partitions
         // have been completely populated before starting the checkpointing there by avoiding weird race conditions
+
+        // 启动高水位检查点专属线程
+        // 定期将Broker上所有非Offline分区的高水位值写入到检查点文件
         startHighWatermarkCheckPointThread()
 
         val futureReplicasAndInitialOffset = new mutable.HashMap[TopicPartition, InitialFetchState]
@@ -1359,9 +1404,11 @@ class ReplicaManager(val config: KafkaConfig,
 
         //关闭ReplicaFetcherManagerIdle 中空闲的 fetcher 线程
         replicaFetcherManager.shutdownIdleFetcherThreads()
+        // 关闭空闲日志路径数据迁移线程
         replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
         //回调函数
         onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
+        // 构造LeaderAndIsrRequest请求的Response并返回
         val responsePartitions = responseMap.iterator.map { case (tp, error) =>
           new LeaderAndIsrPartitionError()
             .setTopicName(tp.topic)
