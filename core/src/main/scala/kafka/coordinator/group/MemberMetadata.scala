@@ -21,6 +21,18 @@ import java.util
 
 import kafka.utils.nonthreadsafe
 
+/**
+ * 组成员概要信息,提取了最核心的元数据信息：
+ * bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group mygroup --verbose --state
+ * 由此对象提供
+ *
+ * @param memberId 组成员ID， 由 Kafka 自动生成
+ * @param groupInstanceId Consumer 端参数 group.instance.id 值
+ * @param clientId  client.id 参数值
+ * @param clientHost Consumer 端程序主机名
+ * @param metadata 消费组成员使用的分配策略 partition.assignment.strategy 参数
+ * @param assignment 成员订阅分区
+ */
 case class MemberSummary(memberId: String,
                          groupInstanceId: Option[String],
                          clientId: String,
@@ -29,11 +41,14 @@ case class MemberSummary(memberId: String,
                          assignment: Array[Byte])
 
 private object MemberMetadata {
+  // 提取分区分配策略集合
   def plainProtocolSet(supportedProtocols: List[(String, Array[Byte])]) = supportedProtocols.map(_._1).toSet
 }
 
 /**
  * Member metadata contains the following metadata:
+ *
+ * 消费组成员的元数据
  *
  * Heartbeat metadata:
  * 1. negotiated heartbeat session timeout
@@ -53,22 +68,28 @@ private object MemberMetadata {
  *                            and the group transitions to stable
  */
 @nonthreadsafe
-private[group] class MemberMetadata(var memberId: String,
+private[group] class MemberMetadata(var memberId: String, // 成员id， 由kafka 自动生成
                                     val groupId: String,
                                     val groupInstanceId: Option[String],
                                     val clientId: String,
                                     val clientHost: String,
-                                    val rebalanceTimeoutMs: Int,
-                                    val sessionTimeoutMs: Int,
-                                    val protocolType: String,
+                                    val rebalanceTimeoutMs: Int,  // Rebalane操作超时时间
+                                    val sessionTimeoutMs: Int, // 会话超时时间
+                                    val protocolType: String, // 对消费者组而言，是"consumer"
+                                    // 成员配置的多套分区分配策略
                                     var supportedProtocols: List[(String, Array[Byte])]) {
-
+  // 分区分配方案
   var assignment: Array[Byte] = Array.empty[Byte]
+  // 表示组成员是否正在等待加入组。
   var awaitingJoinCallback: JoinGroupResult => Unit = null
+  // 表示组成员是否正在等待 GroupCoordinator 发送分配方案
   var awaitingSyncCallback: SyncGroupResult => Unit = null
   var latestHeartbeat: Long = -1
+  // 表示组成员是否发起“退出组”的操作。
   var isLeaving: Boolean = false
+  // 表示是否是消费者组下的新成员。
   var isNew: Boolean = false
+  // 是否是静态成员 group.instance.id
   val isStaticMember: Boolean = groupInstanceId.isDefined
 
   def isAwaitingJoin = awaitingJoinCallback != null
